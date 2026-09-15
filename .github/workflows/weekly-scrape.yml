@@ -117,6 +117,7 @@ jobs:
           GALLERY=$(python3 -c "import json;print(json.load(open('src/data/catalog/index.json'))['counts']['showcases'])")
           FLOWS=$(python3 -c "import json;print(json.load(open('src/data/catalog/index.json'))['counts']['workflows'])")
           git commit -m "weekly scrape $(date -u '+%Y-%m-%d %H:%M UTC'): ${TOTAL} records (gallery ${GALLERY}, workflows ${FLOWS})"
+          git pull --rebase "https://x-access-token:${GH_TOKEN}@github.com/wesisad5/aix-studio-scraper.git" main || true
           git push "https://x-access-token:${GH_TOKEN}@github.com/wesisad5/aix-studio-scraper.git" main
 
       - name: Upload run report
