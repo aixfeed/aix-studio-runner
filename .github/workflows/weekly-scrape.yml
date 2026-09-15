@@ -1,0 +1,142 @@
+name: Weekly AIX Scrape
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'   # every Monday 03:00 UTC
+  workflow_dispatch:       # manual trigger for verification
+
+permissions:
+  contents: read           # runner repo: code only, no push needed
+  issues: write            # failure notifications
+
+concurrency:
+  group: weekly-scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout runner repo (pipeline code)
+        uses: actions/checkout@v4
+
+      - name: Clone data repo (data + resume state)
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_PAT }}
+        run: |
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/wesisad5/aix-studio-scraper.git" data
+          echo "data repo HEAD: $(git -C data log --oneline -1)"
+
+      - name: Sync current pipeline code into data repo
+        run: |
+          cp -f scripts/*.py data/scripts/
+          cp -f run.sh data/ 2>/dev/null || true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-v1
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright
+          python -m playwright install chromium --with-deps
+
+      - name: Write AIX auth token
+        env:
+          AIX_TOKEN: ${{ secrets.AIX_TOKEN }}
+        run: |
+          if [ -z "$AIX_TOKEN" ]; then
+            echo "::warning::AIX_TOKEN secret not set — authed scrape will fail"
+          fi
+          printf '%s' "$AIX_TOKEN" > data/scripts/.aix_token
+
+      - name: Transport smoke test (fail fast on WAF / site down)
+        env:
+          AIX_BASE: ${{ github.workspace }}/data
+          AIX_TRANSPORT: playwright
+        run: python3 scripts/aix_transport.py
+
+      - name: Scrape public catalogs (gallery, flows, assets, ...)
+        env:
+          AIX_BASE: ${{ github.workspace }}/data
+          AIX_TRANSPORT: playwright
+        run: python3 scripts/aix_scraper.py
+
+      - name: Auth scrape (canvas graphs + gated libraries)
+        env:
+          AIX_BASE: ${{ github.workspace }}/data
+          AIX_TRANSPORT: playwright
+        run: python3 scripts/aix_auth_scrape.py
+
+      - name: Aux (comments + taxonomies)
+        env:
+          AIX_BASE: ${{ github.workspace }}/data
+          AIX_TRANSPORT: playwright
+        run: python3 scripts/aix_aux.py
+
+      - name: Enrich (creator profiles)
+        env:
+          AIX_BASE: ${{ github.workspace }}/data
+          AIX_TRANSPORT: playwright
+        run: python3 scripts/aix_enrich.py
+
+      - name: Finalize + rebuild catalogs
+        env:
+          AIX_BASE: ${{ github.workspace }}/data
+        run: |
+          python3 scripts/aix_finalize.py
+          python3 scripts/aix_build_catalog.py
+          python3 scripts/aix_build_catalog_auth.py
+
+      - name: Validate (pre-push data gate)
+        env:
+          AIX_BASE: ${{ github.workspace }}/data
+        run: python3 scripts/aix_validate.py
+
+      - name: Commit and push data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_PAT }}
+        run: |
+          cd data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes — data unchanged this run"
+            exit 0
+          fi
+          TOTAL=$(python3 -c "import json;print(sum(json.load(open('src/data/catalog/index.json'))['counts'].values()))")
+          GALLERY=$(python3 -c "import json;print(json.load(open('src/data/catalog/index.json'))['counts']['gallery'])")
+          FLOWS=$(python3 -c "import json;print(json.load(open('src/data/catalog/index.json'))['counts']['workflows'])")
+          git commit -m "weekly scrape $(date -u '+%Y-%m-%d %H:%M UTC'): ${TOTAL} records (gallery ${GALLERY}, workflows ${FLOWS})"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/wesisad5/aix-studio-scraper.git" main
+
+      - name: Upload run report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-report-${{ github.run_id }}
+          path: data/download/aixstudio/dataset_stats.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Open issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Weekly AIX scrape failed (${new Date().toISOString().slice(0, 10)})`,
+              body: `Automated scrape run failed.\n\nRun logs: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nLikely causes: AIX_TOKEN expired (code 333), site redeploy/schema drift, or WAF blocking the runner IP.`,
+              labels: ['scrape-failure']
+            });
