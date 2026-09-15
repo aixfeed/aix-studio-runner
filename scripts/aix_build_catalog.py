@@ -18,7 +18,7 @@ import json, os, re, collections
 
 import os
 SRC = f"{os.environ.get("AIX_BASE", "/home/z/my-project")}/download/aixstudio"
-DST = "/home/z/my-project/src/data/catalog"
+DST = f'{os.environ.get("AIX_BASE", "/home/z/my-project")}/src/data/catalog'
 os.makedirs(DST, exist_ok=True)
 
 def load(name):
