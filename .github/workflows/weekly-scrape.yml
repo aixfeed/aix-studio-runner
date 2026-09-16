@@ -102,6 +102,7 @@ jobs:
           python3 scripts/aix_finalize.py
           python3 scripts/aix_build_catalog.py
           python3 scripts/aix_build_catalog_auth.py
+          python3 scripts/aix_media_manifest.py
 
       - name: Validate (pre-push data gate)
         env:
