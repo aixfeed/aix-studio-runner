@@ -28,10 +28,17 @@ jobs:
           git clone "https://x-access-token:${GH_TOKEN}@github.com/wesisad5/aix-studio-scraper.git" data
           echo "data repo HEAD: $(git -C data log --oneline -1)"
 
-      - name: Sync current pipeline code into data repo
+      - name: Sync pipeline code FROM data repo (data repo = source of truth)
         run: |
-          cp -f scripts/*.py data/scripts/
-          cp -f run.sh data/ 2>/dev/null || true
+          # The data repo carries the authoritative pipeline code (developed
+          # and tested locally, pushed with each fix). Syncing runner->data
+          # caused the 2026-09-15 revert: a run dispatched before a script fix
+          # reached this repo clobbered the fixed builders in the data repo.
+          # Direction is now data->runner: the runner executes whatever main
+          # has, and never writes scripts back into the data repo.
+          cp -f data/scripts/*.py scripts/
+          cp -f data/run.sh . 2>/dev/null || true
+          echo "pipeline code synced from data repo @ $(git -C data rev-parse --short HEAD)"
 
       - name: Set up Python
         uses: actions/setup-python@v5

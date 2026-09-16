@@ -7,12 +7,20 @@ CI runner for the AIX Studio (aix.studio) AIGC data pipeline.
 | repo | visibility | role |
 |---|---|---|
 | `wesisad5/aix-studio-scraper` | private | **data** — raw JSONL, parsed catalog, resume state |
-| `mj-feed/aix-studio-runner` (this) | public | **code + CI** — pipeline scripts, weekly GHA workflow |
+| `aixfeed/aix-studio-runner` (this) | public | **CI bootstrap** — weekly GHA workflow; pipeline code is synced FROM the data repo at run start |
 
-The workflow checks this repo out for code, clones the private data repo with a
-PAT, runs the full pipeline against the live site, validates, and pushes the
-data repo. Public runner = free unlimited Actions minutes; the private data
-repo never needs to run Actions.
+The workflow checks this repo out for the workflow + bootstrap, clones the
+private data repo with a PAT, **syncs pipeline code from the data repo's main**
+(the data repo is the single source of truth — script fixes land there with
+their tests), runs the full pipeline against the live site, validates, and
+pushes the data repo. Public runner = free unlimited Actions minutes; the
+private data repo never needs to run Actions.
+
+> Direction hardening (2026-09-16): the sync used to copy this repo's
+> `scripts/` INTO the data repo. A run dispatched before a script fix landed
+> here reverted the fixed builders in the data repo (458e842). The sync now
+> runs data->runner only; this repo's `scripts/` is kept in sync as a
+> convenience snapshot and is never the authority.
 
 ## Pipeline (what the workflow does)
 

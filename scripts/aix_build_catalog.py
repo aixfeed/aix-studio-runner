@@ -84,10 +84,19 @@ def parse_generation(r):
 
     prompts, instructions, refs, seeds, sizes = [], [], [], [], []
     settings = collections.defaultdict(list)
-    for item in (pj.get("paramList") or []):
+    # params may live in `paramList` AND/OR `oldParamList` (107/191 records
+    # carry both; 6 records have prompt text ONLY in oldParamList) — iterate
+    # both, deduped by component+name+defValue.
+    seen_items = set()
+    plists = (pj.get("paramList") or []) + (pj.get("oldParamList") or [])
+    for item in plists:
         c = item.get("component") or ""
         dv = str(item.get("defValue") or "").strip()
         field = item.get("name")
+        key = (c, field, dv)
+        if key in seen_items:
+            continue
+        seen_items.add(key)
         if c in PROMPT_COMPS and len(dv) > 1:
             prompts.append({"field": field, "text": dv})
         elif c == "CustomTextInput" and len(dv) > 8:
