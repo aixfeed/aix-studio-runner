@@ -89,6 +89,12 @@ jobs:
           AIX_TRANSPORT: playwright
         run: python3 scripts/aix_prism_tags.py
 
+      - name: Lib detail sweep (character/prop/scene /detail enrichment)
+        env:
+          AIX_BASE: ${{ github.workspace }}/data
+          AIX_TRANSPORT: playwright
+        run: python3 scripts/aix_lib_details.py
+
       - name: Aux (comments + taxonomies)
         env:
           AIX_BASE: ${{ github.workspace }}/data
