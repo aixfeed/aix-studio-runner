@@ -83,6 +83,12 @@ jobs:
           AIX_TRANSPORT: playwright
         run: python3 scripts/aix_auth_scrape.py
 
+      - name: Prism tag sweep (style_materials taxonomy)
+        env:
+          AIX_BASE: ${{ github.workspace }}/data
+          AIX_TRANSPORT: playwright
+        run: python3 scripts/aix_prism_tags.py
+
       - name: Aux (comments + taxonomies)
         env:
           AIX_BASE: ${{ github.workspace }}/data
