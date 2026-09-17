@@ -190,11 +190,17 @@ jobs:
           # anymore. Works from any Node environment (this public runner has
           # free unlimited minutes; the sandbox and any machine are
           # fallbacks — the "leverage Netlify beyond GHA" hedge).
+          # connectivity preflight: the CN CDN occasionally stalls runner
+          # IPs (WAF); surface reachability in the log before the sync
+          PROBE=$(python3 -c "import json; print(json.load(open('/tmp/media-queue-full.json'))[0]['url'])")
+          curl -s -o /dev/null --max-time 30 -w "OSS probe: HTTP %{http_code} in %{time_total}s\n" \
+            -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" -I "$PROBE" || true
           cd netlify-vault && npm install --no-audit --no-fund --silent
           set +e
           NETLIFY_AUTH_TOKEN="$NETLIFY_AUTH_TOKEN" TARGET_SITE_ID="$TARGET_SITE" \
           QUEUE_FILE=/tmp/media-queue-full.json MERGED_INDEX_FILE=/tmp/blob-merged-index.json \
           BLOB_CONCURRENCY=6 BLOB_MAX_MINUTES=25 BLOB_MAX_ITEM_BYTES=60000000 \
+          BLOB_FETCH_TIMEOUT_MS=60000 \
           node blob-sync.mjs
           rc=$?
           set -e
