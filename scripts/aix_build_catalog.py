@@ -55,6 +55,170 @@ for t in (aux.get("flow_tags", {}).get("data") or []):
 
 flows_by_id = {r["id"]: r for r in load("flows")}
 
+# gallery comments (317 galleries) — joined onto showcase records
+try:
+    gallery_comments = json.load(open(f"{SRC}/gallery_comments.json"))
+except FileNotFoundError:
+    gallery_comments = {}
+
+# flowCode -> product name (audit round2-c P2 — turns cryptic modelCode
+# facets like tap_03 into Chinese product names like "AIX全能语言模型G3").
+# Harvested RECURSIVELY from aux_public + aux_public2: card_classify
+# flowList, workflow_tap03/workflow_main_image single-shots, cloud cards —
+# 86 pairs total (1388/tap_04 remain unnamed: not in any captured metadata).
+MODEL_NAME = {}
+def _harvest_names(o):
+    if isinstance(o, dict):
+        fc, fn = o.get("flowCode"), o.get("flowName")
+        if fc and fn and not isinstance(fc, (dict, list)):
+            MODEL_NAME.setdefault(str(fc), str(fn))
+        for v in o.values():
+            _harvest_names(v)
+    elif isinstance(o, list):
+        for x in o:
+            _harvest_names(x)
+_harvest_names(aux)
+_harvest_names(aux2)
+
+# Flow graph summaries (from authed flow_details*.jsonl chunks — ALL flow
+# types carry aix-format canvasJson since the 2026-09-16 probe). Joined onto
+# workflow records so every graph-backed workflow opens the React Flow viewer.
+# ALSO joined per-flow (flow_details is richer than the list view):
+#   - createTime/updateTime (list view strips BOTH → 0/3,149 had timestamps)
+#   - tag ids via flow_tag (637 flows tagged in details, 0 in list view)
+#   - per-node prompts (targetInfoList.des + text-node payloads — the latent
+#     ~7.3M-char prompt corpus surfaced as record-level `prompt`)
+#   - model codes (node data.flowCode: gpt-image-2 / tap_03 / main_image …)
+flow_graphs = {}
+import glob as _glob, re as _re
+def _chunk_key(p):
+    m = _re.search(r"_(\d+)\.jsonl$", p)
+    return (int(m.group(1)) if m else 0, p)   # numeric order: _2 < _10
+
+def _story_prompts(nodes):
+    """Consolidated storyboard/screenplay text (audit round2-c P1 — ~1MB of
+    shotPrompt/sceneDesc/dialogue/sound/light text + full screenplays were
+    captured in scriptGen + shot-bearing nodes but never surfaced). One
+    consolidated entry per story node keeps record.prompt compact."""
+    out = []
+    for n in nodes:
+        d = n.get("data") or {}
+        if not isinstance(d, dict):
+            continue
+        parts = []
+        for k, name in (("storyboardUserPrompt", "剧本"), ("storyboardParsedDes", "分镜解析")):
+            v = d.get(k)
+            if isinstance(v, str) and len(v) > 60:
+                parts.append(f"【{name}】\n{v}")
+        for ep in (d.get("episodes") or []):
+            if isinstance(ep, dict):
+                st = ep.get("scriptText")
+                if isinstance(st, str) and len(st) > 60:
+                    parts.append(f"【{ep.get('name') or '剧集'}】\n{st}")
+        shot_lines = []
+        for sh in (d.get("shots") or []):
+            if not isinstance(sh, dict):
+                continue
+            no = sh.get("shotNo") or "?"
+            bits = []
+            for k, name in (("sceneDesc", "场景"), ("sceneType", "景别"), ("characterAction", "动作"),
+                            ("emotion", "情绪"), ("dialogue", "台词"), ("soundEffect", "音效"),
+                            ("lightMood", "光影"), ("shotPrompt", "画面提示词"),
+                            ("videoMotionPrompt", "运镜"), ("duration", "时长")):
+                v = sh.get(k)
+                if isinstance(v, str) and v.strip() and v != "无":
+                    bits.append(f"{name}: {v}")
+            for ch in (sh.get("characters") or []):
+                if isinstance(ch, dict) and ch.get("name"):
+                    cd_ = ch.get("desc")
+                    bits.append(f"人物 {ch['name']}: {cd_}" if cd_ else f"人物 {ch['name']}")
+            if bits:
+                shot_lines.append(f"— 分镜{no} —\n" + "\n".join(bits))
+        if shot_lines:
+            parts.append(f"【分镜脚本 · {len(shot_lines)} shots】\n" + "\n\n".join(shot_lines))
+        if parts:
+            text = "\n\n".join(parts)
+            if len(text) > 8000:
+                text = text[:8000] + f" … [{len(text)-8000} chars truncated]"
+            label = n.get("label") or d.get("label") or "剧本分镜"
+            out.append({"field": f"{label} · story", "text": text})
+    return out
+
+def _graph_prompts(nodes):
+    """per-node prompt texts (des-bearing targetInfoList + text-node fields),
+    longest first. Individual texts capped at 4000 chars (pathological graphs
+    carry whole screenplays); promptChars carries the true total."""
+    out = []
+    for n in nodes:
+        label = n.get("label") or (n.get("data") or {}).get("label")
+        d = n.get("data") or {}
+        for k in ("text", "value", "content", "defValue"):
+            v = d.get(k)
+            if isinstance(v, str) and len(v) > 25:
+                out.append({"field": label or k, "text": v}); break
+        for ti in ((n.get("target") or {}).get("targetInfoList") or []):
+            v = ti.get("des") or ti.get("text")
+            if isinstance(v, str) and len(v) > 25:
+                out.append({"field": label or "des", "text": v})
+        # FLAT target.des (audit round2-e P1): 2,532 input/text nodes carry
+        # ~2.2M chars of prompt text ONLY on the flat field (no TIL entry,
+        # or a different text than the TIL one) — text-dedup absorbs the
+        # 9,148 nodes where flat == TIL entry.
+        fd = (n.get("target") or {}).get("des")
+        if isinstance(fd, str) and len(fd) > 25:
+            out.append({"field": label or "des", "text": fd})
+    out.sort(key=lambda p: -len(p["text"]))
+    total = sum(len(p["text"]) for p in out)
+    # story corpus rides FIRST (before the per-prompt 4000 cap re-truncates)
+    story = _story_prompts(nodes)
+    for p in out:   # cap individual texts (screenplay-class nodes exist)
+        if len(p["text"]) > 4000:
+            p["text"] = p["text"][:4000] + f" … [{len(p['text'])-4000} chars truncated]"
+    # dedupe by TEXT — same prompt in paramList AND oldParamList, or the
+    # same des repeated across nodes (51 workflows carried duplicate entries)
+    seen_pt = set()
+    deduped = [p for p in out if p["text"] not in seen_pt and not seen_pt.add(p["text"])]
+    # story entries ride first, then the longest per-node prompts
+    merged = story + deduped
+    return (merged[:12], len(merged), sum(len(p["text"]) for p in merged))
+
+for _fp in sorted(_glob.glob(f"{SRC}/auth/flow_details*.jsonl"), key=_chunk_key):
+    with open(_fp) as _f:
+        for _l in _f:
+            try:
+                _r = json.loads(_l)
+            except Exception:
+                continue
+            _fid = str(_r.get("__flowId") or "")
+            if not _fid or _fid in flow_graphs: continue
+            try:
+                _g = json.loads(_r.get("canvasJson") or "null") or {}
+            except Exception:
+                continue
+            _nodes = _g.get("nodes") or []
+            _prompts, _pcount, _pchars = _graph_prompts(_nodes)
+            _mc = collections.Counter(
+                str((n.get("data") or {}).get("flowCode"))
+                for n in _nodes if (n.get("data") or {}).get("flowCode"))
+            flow_graphs[_fid] = {
+                "nodeCount": len(_nodes),
+                "edgeCount": len(_g.get("connections") or []),
+                "groupCount": len(_g.get("groups") or []),
+                "nodeTypes": dict(collections.Counter(str(n.get("type")) for n in _nodes)),
+                "prompts": _prompts or None,
+                "promptCount": _pcount,
+                "promptChars": _pchars,
+                "modelCodes": [k for k, _ in _mc.most_common(6)] or None,
+                "createTime": _r.get("createTime"),
+                "updateTime": _r.get("updateTime"),
+                "tagIds": [str(t) for t in ([_r.get("canvasFlowTagInfoId"), _r.get("sonTagId")] if _r.get("sonTagId") else [_r.get("canvasFlowTagInfoId")]) if t] or None,
+                "des": _r.get("des"),
+            }
+print(f"[flows] graph summaries: {len(flow_graphs)} of {len(flows_by_id)} flows")
+print(f"[flows] prompt corpus: {sum(v['promptChars'] for v in flow_graphs.values()):,} chars, "
+      f"{sum(v['promptCount'] for v in flow_graphs.values()):,} prompt nodes, "
+      f"{sum(1 for v in flow_graphs.values() if v['modelCodes']):,} flows with model codes")
+
 def creator_of(uid, name=None, avatar=None):
     uid = str(uid) if uid else None
     p = profiles.get(uid) if uid else None
@@ -97,8 +261,15 @@ def parse_generation(r):
         if key in seen_items:
             continue
         seen_items.add(key)
-        if c in PROMPT_COMPS and len(dv) > 1:
-            prompts.append({"field": field, "text": dv})
+        if c in PROMPT_COMPS:
+            if len(dv) > 1:
+                prompts.append({"field": field, "text": dv})
+            # desList entries under prompt components are prompt continuations,
+            # not instructions (37/103 "prompt-less" generations had full
+            # prompts hiding there — audit wave 1 P2)
+            for d in (item.get("desList") or []):
+                if isinstance(d, str) and len(d) > 8:
+                    prompts.append({"field": (field or "") + " · des", "text": d})
         elif c == "CustomTextInput" and len(dv) > 8:
             instructions.append({"field": field, "text": dv})
         elif c in SELECT_COMPS and dv:
@@ -109,9 +280,16 @@ def parse_generation(r):
             sizes.append({"field": field, "value": num(dv)})
         elif c == "ImageUploadAuto" and dv.startswith("http"):
             refs.append(dv)
-        for d in (item.get("desList") or []):
-            if isinstance(d, str) and len(d) > 8:
-                instructions.append({"field": (field or "") + " · des", "text": d})
+        elif c not in PROMPT_COMPS:
+            for d in (item.get("desList") or []):
+                if isinstance(d, str) and len(d) > 8:
+                    instructions.append({"field": (field or "") + " · des", "text": d})
+
+    # dedupe by TEXT: desList entries can repeat the defValue text verbatim
+    # under a different field label (gen_120144 self-duplicated)
+    _seen = set()
+    prompts = [p for p in prompts if p["text"] not in _seen and not _seen.add(p["text"])]
+    instructions = [p for p in instructions if p["text"] not in _seen and not _seen.add(p["text"])]
 
     # model / quality from paramStr e.g. "9:16 | veo3.1-fast", "10 s | 竖版高清"
     param_str = pj.get("paramStr")
@@ -155,7 +333,7 @@ def parse_generation(r):
         },
         "referenceImages": refs or None,
         "workflow": {"id": r.get("cworkFlowInfoId"), "name": (flow or {}).get("name"),
-                     "kind": "canvas" if str((flow or {}).get("type")) == "2" else "comfy"} if flow else None,
+                     "kind": "canvas work" if str((flow or {}).get("type")) == "2" else "node canvas"} if flow else None,
         "creator": creator_of(r.get("userId") or r.get("createUserId"), r.get("nickName"), r.get("avatarUrl")),
         "stats": {"likes": num(r.get("goodNum")) or 0, "collects": num(r.get("collectNum")) or 0},
         "cost": {"runtimeSec": num(pj.get("runTime")), "spend": num(pj.get("spendNum"))},
@@ -168,6 +346,14 @@ generations = [parse_generation(r) for r in load("task_outputs")]
 # ---------- 2. SHOWCASES (gallery) ----------
 def parse_showcase(r):
     kind = media_kind_from_url(r.get("workFileKey")) or ("canvas" if not r.get("workFileKey") else "image")
+    cm = gallery_comments.get(str(r["id"])) or {}
+    comments = None
+    if cm.get("comment"):
+        comments = [{"user": c.get("nickName"), "content": c.get("content"), "at": c.get("createTime")}
+                    for c in cm["comment"] if c.get("content")][:5]
+    stats = {"likes": num(r.get("goodNum")) or 0, "collects": num(r.get("collectNum")) or 0}
+    if num(cm.get("total")):
+        stats["comments"] = num(cm.get("total"))
     return {
         "id": f"show_{r['id']}", "sourceId": r["id"], "type": "showcase",
         "title": r.get("name"), "description": r.get("des"),
@@ -176,9 +362,11 @@ def parse_showcase(r):
             "thumb": r.get("coverFileKey") or r.get("thumbnailUrl"),
             "width": num(r.get("width")), "height": num(r.get("height")), "bytes": num(r.get("fileSize")),
         },
-        "tags": [t for t in (r.get("parentTagNames") or []) if t] + [t for t in (r.get("sonTagNames") or []) if t],
+        "tags": list(dict.fromkeys([t for t in (r.get("parentTagNames") or []) if t]
+                                   + [t for t in (r.get("sonTagNames") or []) if t])),
         "creator": creator_of(r.get("userId"), r.get("nickName"), r.get("avatarUrl")),
-        "stats": {"likes": num(r.get("goodNum")) or 0, "collects": num(r.get("collectNum")) or 0},
+        "stats": stats,
+        "comments": comments,
         "timestamps": {"created": r.get("createTime"), "updated": r.get("updateTime")},
         "canvasRef": r.get("canvasJsonInfoId") or None,  # JWT-phase join key
     }
@@ -186,27 +374,54 @@ def parse_showcase(r):
 showcases = [parse_showcase(r) for r in load("gallery")]
 
 # ---------- 3. WORKFLOWS (flows) ----------
-FLOW_TYPE = {"1": "comfy", "2": "canvas", "3": "draft", "4": "tool", "None": "other"}
+# Flow type labels. NOTE (2026-09-16 audit): ALL flow payloads are the site's
+# OWN node-canvas format (nodes/connections/groups React-Flow-like JSON) —
+# there is ZERO ComfyUI-format JSON anywhere in canvas-flow/details (the
+# "ComfyUI" naming came from the site's /apinew/comfy/* API namespace).
+# Type 1 (2,756 flows) is the workflow-template library the site brands as
+# "ComfyUI Workflow" — relabeled "node canvas" to describe the actual data.
+FLOW_TYPE = {"1": "node canvas", "2": "canvas work", "3": "draft", "4": "tool", "None": "other"}
 def parse_flow(r):
     tags = []
     tid = str(r.get("canvasFlowTagInfoId") or "")
     if tid and tid in flow_tag: tags.append(flow_tag[tid])
     sid = str(r.get("sonTagId") or "")
     if sid and sid in flow_tag: tags.append(flow_tag[sid])
+    # graph join (flow_details is richer than the list view)
+    fg = flow_graphs.get(str(r["id"]))
+    if fg:
+        # tags: prefer the details view (list view strips tag ids entirely)
+        det_tags = [flow_tag.get(t) for t in (fg.get("tagIds") or [])]
+        det_tags = [t for t in det_tags if t]
+        if det_tags: tags = det_tags
+        # order-preserving dedupe
+        seen_t = set(); tags = [t for t in tags if not (t in seen_t or seen_t.add(t))]
     return {
         "id": f"flow_{r['id']}", "sourceId": r["id"], "type": "workflow",
         "title": r.get("name") or f"Workflow {r['id']}",
-        "description": r.get("des"),
+        "description": (fg or {}).get("des") or r.get("des"),
         "workflowKind": FLOW_TYPE.get(str(r.get("type")), "other"),
         "media": {
             "kind": media_kind_from_url(r.get("findUrl")) or "image",
             "url": r.get("findUrl"), "thumb": r.get("thumbnailUrl") or r.get("findUrl"),
             "width": num(r.get("width")), "height": num(r.get("height")), "bytes": num(r.get("fileSize")),
         },
-        "tags": tags,
+        "tags": tags or None,
         "creator": creator_of(r.get("createUserId"), r.get("nickName")),
-        "timestamps": {"created": r.get("createTime"), "updated": r.get("updateTime")},
-        "canvasRef": str(r["id"]) if str(r.get("type")) == "2" else None,
+        "timestamps": {"created": (fg or {}).get("createTime") or r.get("createTime"),
+                        "updated": (fg or {}).get("updateTime") or r.get("updateTime")},
+        # per-node prompts extracted from the graph (~2.3KB avg per workflow;
+        # full des-corpus searchable via `q` once embedded here)
+        "prompt": (fg or {}).get("prompts"),
+        "promptCount": (fg or {}).get("promptCount") or 0,
+        "modelCodes": (fg or {}).get("modelCodes"),
+        # any flow with a captured graph (type-2 canvas AND type-1 comfy alike)
+        # opens the React Flow viewer via /api/graph?source=flow
+        "canvasRef": str(r["id"]) if str(r["id"]) in flow_graphs else None,
+        "graph": ({k: v for k, v in flow_graphs[str(r["id"])].items()
+                   if k in ("nodeCount", "edgeCount", "groupCount", "nodeTypes")}
+                  if str(r["id"]) in flow_graphs else None),
+        "graphAvailable": str(r["id"]) in flow_graphs,
     }
 
 workflows = [parse_flow(r) for r in flows_by_id.values()]
@@ -229,18 +444,22 @@ style_materials = [parse_prism(r) for r in load("prism_material")]
 
 # ---------- 5. ASSETS ----------
 def parse_asset(r):
+    # media kind from the URL (audit round2-c P1: 481 mp4 + 2 audio assets
+    # were hardcoded kind "image" → broken detail media + no video facets)
+    kind = media_kind_from_url(r.get("findUrl")) or media_kind_from_url(r.get("ossUrl")) or "image"
     return {
         "id": f"asset_{r['id']}", "sourceId": r["id"], "type": "asset",
         "title": r.get("name") or f"Asset {r['id']}",
+        "description": r.get("des") or None,
         "media": {
-            "kind": "image", "url": r.get("findUrl"), "thumb": r.get("thumbnailUrl") or r.get("findUrl"),
+            "kind": kind, "url": r.get("findUrl"), "thumb": r.get("thumbnailUrl") or r.get("findUrl"),
             "width": num(r.get("width")), "height": num(r.get("height")), "bytes": num(r.get("fileSize")),
         },
         "creator": creator_of(r.get("createUserId") or r.get("userId"), r.get("nickName")),
         "timestamps": {"created": r.get("createTime")},
     }
 
-assets = [parse_asset(r) for r in load("assets")]
+assets = [parse_asset(r) for r in load("assets")] 
 
 # ---------- 6. USER PRISM (39) — folded into showcases as "community" works ----------
 user_prism = [{
@@ -302,16 +521,32 @@ index = {
         "workflows": {
             "kind": facet(workflows, lambda r: r["workflowKind"]),
             "tags": facet([r for r in workflows if r["tags"]], lambda r: r["tags"][0]),
+            "modelCode": facet([r for r in workflows if r.get("modelCodes")], lambda r: r["modelCodes"][0]),
+            "hasPrompt": {"yes": sum(1 for r in workflows if r.get("prompt")), "no": sum(1 for r in workflows if not r.get("prompt"))},
         },
         "style_materials": {"category": facet(style_materials, lambda r: r["category"])},
+        # Assets tab (7,517 records — the largest tab) had ZERO facets
+        "assets": {
+            "mediaKind": facet(assets, lambda r: r["media"]["kind"]),
+        },
     },
     "canvasQueue": {
         "showcases": sum(1 for r in showcases if r.get("canvasRef")),
         "workflows": sum(1 for r in workflows if r.get("canvasRef")),
         "note": "canvas graph JSON requires JWT (phase 4)",
     },
-    "generatedAt": datetime.date.today().isoformat(),
+    # Data-derived date (max record createTime): byte-stable across rebuilds
+    # of the same inputs, so the GHA conditional-commit skip actually works.
+    # datetime.today() churned daily and forced empty commits.
+    "generatedAt": max(
+        (str(r.get("timestamps", {}).get("created") or "") for coll in
+         (generations, showcases, workflows, style_materials, assets) for r in coll),
+        default=""
+    )[:10] or "unknown",
     "sourceSite": "aix.studio",
+    # modelCode -> product-name labels for the Workflows modelCode facet
+    # (auth builder MERGES its attr labels into this dict — do not replace)
+    "filterLabels": {f"modelCode:{code}": name for code, name in MODEL_NAME.items()},
 }
 json.dump(index, open(f"{DST}/index.json", "w"), ensure_ascii=False, indent=1)
 print("\nindex:", json.dumps(index["counts"], indent=1))

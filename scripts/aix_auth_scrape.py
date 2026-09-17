@@ -6,7 +6,9 @@ in-page fetch with `token` header (Bearer does NOT work).
 
 Targets:
   canvas_graphs  — gallery canvases /comfy/canvas-json-copy-info/detail?id=<canvasJsonInfoId>
-  flow_details   — canvas-type workflow graphs /comfy/canvas-flow/details?id=<flowId>
+  flow_details   — ALL workflow graphs /comfy/canvas-flow/details?id=<flowId>
+                  (type-1 "ComfyUI" flows carry aix-format canvasJson too —
+                  probed 2026-09-16; written in ~40MB chunks flow_details*.jsonl)
   character_lib / prop_lib / scene_lib — gated listPage libraries (ID-dedup accumulate)
   singles        — one-shot endpoints incl. tag-info/listPage + partner-info
 
@@ -228,30 +230,52 @@ def scrape_flow_details():
     seen, targets = set(), []
     for r in flows:
         fid = str(r["id"])
-        if fid in seen:
+        if fid in seen or fid in done:
             continue
         seen.add(fid)
-        if str(r.get("type")) == "2" and fid not in done:
-            targets.append(fid)
-    print(f"[flow_details] canvas-flows={len(seen & {str(r['id']) for r in flows if str(r.get('type'))=='2'})} "
-          f"done={len(done)} todo={len(targets)}")
-    outl = f"{OUT}/flow_details.jsonl"
-    B = 3
+        targets.append(fid)   # ALL types: comfy(1) flows carry aix-format graphs too
+    print(f"[flow_details] flows={len(seen)} done={len(done)} todo={len(targets)}")
+
+    # ~40MB chunk rotation: GitHub warns >50MB/file, blocks >100MB. Full sweep
+    # is ~110MB of canvasJson, so flow_details lives in flow_details*.jsonl.
+    CHUNK = 40 * 1024 * 1024
+    def chunk_files():
+        import glob as _g
+        fs = sorted(_g.glob(f"{OUT}/flow_details*.jsonl"))
+        # keep the un-suffixed file first, then _2, _3 ... in numeric order
+        def keyf(p):
+            sfx = p[len(f"{OUT}/flow_details"):].replace(".jsonl", "")
+            return (0, "") if sfx == "" else (1, sfx)
+        return sorted(fs, key=keyf)
+    files = chunk_files()
+    outl = files[-1] if files else f"{OUT}/flow_details.jsonl"
+    def rotate():
+        nonlocal outl
+        import glob as _g
+        n = len(_g.glob(f"{OUT}/flow_details*.jsonl"))
+        outl = f"{OUT}/flow_details_{n + 1}.jsonl"
+        print(f"  rotating output -> {os.path.basename(outl)}")
+
+    B = 6
     for i in range(0, len(targets), B):
         batch = targets[i:i + B]
         bl = json.dumps(batch)
+        # Concurrent in-page fetches (same load profile as the paginated
+        # scrapers' 4-worker pattern; the WAF has never objected). This is
+        # ~6x faster than sequential awaits — the full 2.8k-flow sweep needs
+        # it to finish in ~30min instead of ~3h.
         js = f"""(async()=>{{
           {js_hdr()}
-          const ids={bl}; const out=[];
-          for(const id of ids){{
+          const ids={bl};
+          const out = await Promise.all(ids.map(async (id)=>{{
             try{{
               const r=await fetch('/apinew/comfy/canvas-flow/details?id='+id,{{headers:H}});
               const j=await r.json();
-              if(j.code===333){{ out.push({{id,err:'AUTH333'}}); continue; }}
-              if(j.code!==200||!j.data){{ out.push({{id,err:j.code+' '+(j.message||'').slice(0,25)}}); continue; }}
-              out.push(Object.assign({{__flowId:id}}, j.data));
-            }}catch(e){{ out.push({{id,err:e.message.slice(0,40)}}); }}
-          }}
+              if(j.code===333){{ return {{id,err:'AUTH333'}}; }}
+              if(j.code!==200||!j.data){{ return {{id,err:j.code+' '+(j.message||'').slice(0,25)}}; }}
+              return Object.assign({{__flowId:id}}, j.data);
+            }}catch(e){{ return {{id,err:e.message.slice(0,40)}}; }}
+          }}));
           return JSON.stringify(out);
         }})()"""
         for attempt in range(4):
@@ -265,6 +289,7 @@ def scrape_flow_details():
             print(f"  SKIP batch at {i}")
             continue
         auth_fail = False
+        wrote = False
         with open(outl, "a") as f:
             for rec in d:
                 if rec.get("err"):
@@ -274,12 +299,15 @@ def scrape_flow_details():
                     continue
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 done.add(str(rec.get("__flowId")))
+                wrote = True
+        if wrote and os.path.exists(outl) and os.path.getsize(outl) > CHUNK:
+            rotate()
         if auth_fail:
             print("!! TOKEN EXPIRED — refresh and rerun")
             sys.exit(2)
         st["done"][key] = sorted(done)
         save_state(st)
-        if (i // B) % 20 == 0:
+        if (i // B) % 10 == 0:
             print(f"  progress {i+len(batch)}/{len(targets)} (done {len(done)})")
         time.sleep(0.4)
     print(f"[flow_details] complete: {len(done)}")
@@ -322,11 +350,30 @@ def scrape_singles():
             except Exception as e:
                 print(f"{name}: retry ({str(e)[:60]})")
                 time.sleep(2)
-    json.dump(out, open(f"{OUT}/singles.json", "w"), ensure_ascii=False, indent=1)
+    # atomic write with critical-section guard: the builders' category maps /
+    # filter labels come from singles.json. A partial fetch (code != 200 on a
+    # critical section, or transport death above) must NEVER wipe the previous
+    # good file — that would silently de-categorize every library record
+    # (audit wave 1 P2).
+    critical = ("character_categories", "prop_categories", "scene_categories",
+                "character_filters", "prop_filters", "scene_filters",
+                # audit wave 2: a transient failure on either of these wipes
+                # whole collections from the catalog (0 records) and no floor
+                # caught it (parity passes at 0 == 0)
+                "style_prompts", "prompt_components")
+    bad = [k for k in critical if not out.get(k, {}).get("data")]
+    if bad:
+        print(f"singles: CRITICAL sections failed ({bad}) — keeping previous file")
+        return False
+    tmp = f"{OUT}/singles.json.tmp"
+    json.dump(out, open(tmp, "w"), ensure_ascii=False, indent=1)
+    os.replace(tmp, f"{OUT}/singles.json")
+    return True
 
 
 if __name__ == "__main__":
     which = sys.argv[1:] or ["canvas_graphs", "flow_details", "character_lib", "prop_lib", "scene_lib", "singles"]
+    ok = True
     if "canvas_graphs" in which:
         scrape_canvas_graphs()
     if "flow_details" in which:
@@ -335,5 +382,6 @@ if __name__ == "__main__":
         if lib in which:
             scrape_paged(lib, PAGED_LIBS[lib][0], PAGED_LIBS[lib][1])
     if "singles" in which:
-        scrape_singles()
-    print("DONE")
+        ok = scrape_singles() and ok
+    print("DONE" if ok else "DONE_WITH_ERRORS")
+    sys.exit(0 if ok else 1)

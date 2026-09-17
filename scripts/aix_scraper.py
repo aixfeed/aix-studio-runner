@@ -107,6 +107,7 @@ def scrape_catalog(name, path, size, id_key="id"):
     print(f"[{name}] total={total} pages={npages} have={len(have)}")
 
     added = 0
+    failed_batches = 0
     remaining = list(range(1, npages + 1))
     BATCH = 4  # pages per eval
     for i in range(0, len(remaining), BATCH):
@@ -120,6 +121,7 @@ def scrape_catalog(name, path, size, id_key="id"):
                 time.sleep(3 + attempt * 3)
         else:
             print(f"  SKIP batch {batch} after retries")
+            failed_batches += 1
             continue
         new_recs = []
         for p in batch:
@@ -144,10 +146,16 @@ def scrape_catalog(name, path, size, id_key="id"):
 
     st["sweeps"][name] = {
         "total": total, "have": len(have), "added": added,
+        "failed_batches": failed_batches,
         "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     save_state(st)
     print(f"[{name}] sweep done: +{added} new (cumulative {len(have)})")
+    if failed_batches:
+        # partial sweep must NOT read as success downstream (GHA would ship
+        # incomplete data as if complete — audit wave 1 P2)
+        print(f"[{name}] {failed_batches} batches failed — marking sweep FAILED")
+        return False
     return True
 
 
