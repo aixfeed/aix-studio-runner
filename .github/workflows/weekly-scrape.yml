@@ -16,7 +16,7 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - name: Checkout runner repo (pipeline code)
         uses: actions/checkout@v4
@@ -38,6 +38,9 @@ jobs:
           # has, and never writes scripts back into the data repo.
           cp -f data/scripts/*.py scripts/
           cp -f data/run.sh . 2>/dev/null || true
+          # netlify-vault project (media blob sync build plugin) rides along
+          rm -rf netlify-vault && mkdir -p netlify-vault
+          cp -rf data/mini-services/netlify-vault/* netlify-vault/ 2>/dev/null || true
           echo "pipeline code synced from data repo @ $(git -C data rev-parse --short HEAD)"
 
       - name: Set up Python
@@ -139,6 +142,48 @@ jobs:
           git commit -m "weekly scrape $(date -u '+%Y-%m-%d %H:%M UTC'): ${TOTAL} records (gallery ${GALLERY}, workflows ${FLOWS})"
           git pull --rebase "https://x-access-token:${GH_TOKEN}@github.com/wesisad5/aix-studio-scraper.git" main || true
           git push "https://x-access-token:${GH_TOKEN}@github.com/wesisad5/aix-studio-scraper.git" main
+
+      - name: Sync media thumbs to GH repo (Git data API, no checkout)
+        env:
+          GH_TOKEN: ${{ secrets.THUMBS_REPO_PAT }}
+        run: |
+          # wesisad5/aix-media-thumbs — WebP thumb cache served from
+          # raw.githubusercontent. Exit 3 = backlog remains (catch-up mode),
+          # only exit 1 is a failure.
+          set +e
+          python3 scripts/aix_thumbs_push_ghapi.py \
+            --manifest data/download/aixstudio/media_manifest.json \
+            --catalog data/src/data/catalog \
+            --max-items 1500
+          rc=$?
+          set -e
+          echo "thumbs sync rc=$rc"
+          [ "$rc" = "1" ] && exit 1 || true
+
+      - name: Sync full-res media to Netlify Blobs (bounded weekly chunk)
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+        run: |
+          if [ -z "$NETLIFY_AUTH_TOKEN" ]; then
+            echo "::warning::NETLIFY_AUTH_TOKEN not set — skipping blob sync"
+            exit 0
+          fi
+          # priority queue: P0 videos -> P1 covers -> P2 gallery -> P3 canvas
+          python3 scripts/aix_media_queue.py \
+            --manifest data/download/aixstudio/media_manifest.json \
+            --catalog data/src/data/catalog \
+            --out /tmp/media-queue-full.json
+          # resume state from the blob store itself
+          python3 scripts/aix_blob_index.py fetch --out /tmp/blob-index.json
+          cd netlify-vault/plugins/sync-media && npm install --no-audit --no-fund --silent && cd ../../
+          # preview deploy = 0 credits; the plugin (onPostBuild, the only
+          # phase with blob-write context) uploads a bounded chunk
+          BLOB_CONCURRENCY=6 BLOB_MAX_MINUTES=18 BLOB_MAX_ITEM_BYTES=60000000 \
+          QUEUE_FILE=/tmp/media-queue-full.json INDEX_FILE=/tmp/blob-index.json \
+          npx --yes netlify-cli@27.8.0 deploy --site "$NETLIFY_SITE_ID" \
+            --dir public --auth "$NETLIFY_AUTH_TOKEN" \
+            --message "weekly media sync $(date -u +%F)"
 
       - name: Upload run report
         if: always()
