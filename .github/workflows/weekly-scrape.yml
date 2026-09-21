@@ -228,3 +228,42 @@ jobs:
               body: `Automated scrape run failed.\n\nRun logs: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nLikely causes: AIX_TOKEN expired (code 333), site redeploy/schema drift, or WAF blocking the runner IP.`,
               labels: ['scrape-failure']
             });
+
+  heartbeat:
+    # Keeps THIS repo's scheduled cron alive: GitHub auto-disables cron
+    # workflows in repos with 60 days of no activity, and the runner repo
+    # receives no other commits in steady state. One tiny commit per weekly
+    # run makes the primary schedule self-sustaining. (The data-repo
+    # "Weekly trigger (keepalive)" backup is belt-and-braces — it is
+    # currently blocked by a private-repo Actions startup_failure, root
+    # cause under investigation; see aix-studio-scraper worklog round-7.)
+    needs: scrape
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Commit heartbeat via contents API (no checkout)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          PAYLOAD="$(printf '{"lastRun":"%s","runNumber":%s,"result":"%s"}' \
+            "$TS" "${{ github.run_number }}" "${{ needs.scrape.result }}")"
+          CONTENT="$(printf '%s' "$PAYLOAD" | base64 -w0)"
+          SHA="$(curl -s -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/repos/aixfeed/aix-studio-runner/contents/.github/last-run.json" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("sha",""))')"
+          if [ -n "$SHA" ]; then
+            BODY="$(printf '{"message":"heartbeat %s [skip ci]","content":"%s","sha":"%s"}' "$TS" "$CONTENT" "$SHA")"
+          else
+            BODY="$(printf '{"message":"heartbeat %s [skip ci]","content":"%s"}' "$TS" "$CONTENT")"
+          fi
+          HTTP=$(curl -s -o /tmp/hb.json -w "%{http_code}" -X PUT \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/aixfeed/aix-studio-runner/contents/.github/last-run.json" \
+            -d "$BODY")
+          echo "heartbeat http: $HTTP"; head -c 200 /tmp/hb.json; echo
+          [ "$HTTP" = "200" ] || [ "$HTTP" = "201" ]
