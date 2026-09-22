@@ -167,16 +167,14 @@ jobs:
           # raw.githubusercontent. Exit 3 = backlog remains (catch-up mode),
           # only exit 1 is a failure.
           # A6-P2-4: the Netlify ops executor (ops.sh) pushes to the SAME
-          # thumbs repo with the same script; a concurrent ref move between
-          # the pusher's GET and PATCH 422-crashes one writer. Take the
-          # thumbs-push-lock advisory lock (vault-0 `ops` store); if the ops
-          # executor holds it, DEFER (success-with-notice — backlog mode, no
-          # data loss). Lock script rides in from the data repo via the sync
-          # step; until it lands there, proceed unlocked with a warning.
+          # Netlify thumbs store; concurrent index writes clobber (round-5
+          # class). Take the thumbs-push-lock advisory lock (vault-0 `ops`
+          # store); if the ops executor holds it, DEFER (success-with-notice
+          # — backlog mode, no data loss).
           if [ -f scripts/blob_sync_lock.py ] && [ -n "${NETLIFY_AUTH_TOKEN:-}" ]; then
             VAULT0=$(python3 -c "import json; print(json.load(open('data/media_shards.json'))['shards'][0]['id'])")
             LOCK_SCRIPT="$(pwd)/scripts/blob_sync_lock.py"
-            if python3 "$LOCK_SCRIPT" acquire --site "$VAULT0" --key thumbs-push-lock --holder gha-weekly; then
+            if python3 "$LOCK_SCRIPT" acquire --site "$VAULT0" --key thumbs-push-lock --holder gha-weekly --ttl 3600; then
               trap 'python3 "$LOCK_SCRIPT" release --site "$VAULT0" --key thumbs-push-lock --holder gha-weekly || true' EXIT
               echo "thumbs-push-lock acquired (holder gha-weekly)"
             else
@@ -190,12 +188,20 @@ jobs:
           else
             echo "::warning::blob_sync_lock.py or NETLIFY_AUTH_TOKEN unavailable — thumbs sync proceeds without lock"
           fi
+          # ROUND-9 CUTOVER: thumbs now land on the NETLIFY thumbs blob store
+          # (aix-media-thumbs site) — the GH thumbs repo is FROZEN at the
+          # pre-migration corpus and serves only as the route's fallback tier.
+          # Same queue semantics, same 3-strike skips, same exit contract.
+          # timeout guard: 124 (timeout) remapped to 3 = backlog remains.
           set +e
-          python3 scripts/aix_thumbs_push_ghapi.py \
+          timeout --signal=TERM --kill-after=30 2700 \
+            env THUMBS_SITE_ID=75c01060-e863-4377-bbed-820ce64fafac \
+            python3 scripts/aix_thumbs_push_netlify.py \
             --manifest data/download/aixstudio/media_manifest.json \
             --catalog data/src/data/catalog \
             --max-items 1500 --chunk 250 --fetch-workers 6
           rc=$?
+          [ "$rc" = "124" ] && rc=3
           set -e
           echo "thumbs sync rc=$rc"
           # whitelist 0 (complete) / 3 (backlog remains); anything else
