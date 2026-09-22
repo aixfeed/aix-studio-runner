@@ -154,13 +154,18 @@ jobs:
           python3 scripts/aix_thumbs_push_ghapi.py \
             --manifest data/download/aixstudio/media_manifest.json \
             --catalog data/src/data/catalog \
-            --max-items 1500
+            --max-items 1500 --chunk 250 --fetch-workers 6
           rc=$?
           set -e
           echo "thumbs sync rc=$rc"
-          [ "$rc" = "1" ] && exit 1 || true
+          # whitelist 0 (complete) / 3 (backlog remains); anything else
+          # (1 error, 2 argparse, 137 kill) is a failure
+          [ "$rc" = "0" ] || [ "$rc" = "3" ] || exit 1
 
       - name: Sync full-res media to Netlify Blobs (sharded, direct SDK writes)
+        # decoupled from thumbs success (runs 18/19 lesson: a thumbs failure
+        # must not skip the blob chunk too — they are independent stores)
+        if: ${{ !cancelled() }}
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
         run: |
@@ -205,7 +210,7 @@ jobs:
           rc=$?
           set -e
           echo "blob sync rc=$rc"
-          [ "$rc" = "1" ] && exit 1 || true
+          [ "$rc" = "0" ] || [ "$rc" = "3" ] || exit 1
 
       - name: Upload run report
         if: always()
