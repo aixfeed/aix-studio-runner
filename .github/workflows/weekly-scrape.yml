@@ -36,6 +36,10 @@ jobs:
           # reached this repo clobbered the fixed builders in the data repo.
           # Direction is now data->runner: the runner executes whatever main
           # has, and never writes scripts back into the data repo.
+          # A6-P2-2: clean BEFORE copying — `cp -f` alone never deletes, so a
+          # script removed/renamed in the data repo kept executing here
+          # silently with stale semantics. Deletions must propagate.
+          rm -f scripts/*.py run.sh
           cp -f data/scripts/*.py scripts/
           cp -f data/run.sh . 2>/dev/null || true
           # netlify-vault project (media blob sync build plugin) rides along
@@ -140,16 +144,52 @@ jobs:
           GALLERY=$(python3 -c "import json;print(json.load(open('src/data/catalog/index.json'))['counts']['showcases'])")
           FLOWS=$(python3 -c "import json;print(json.load(open('src/data/catalog/index.json'))['counts']['workflows'])")
           git commit -m "weekly scrape $(date -u '+%Y-%m-%d %H:%M UTC'): ${TOTAL} records (gallery ${GALLERY}, workflows ${FLOWS})"
-          git pull --rebase "https://x-access-token:${GH_TOKEN}@github.com/wesisad5/aix-studio-scraper.git" main || true
+          # A6-P2-3: a push to the data repo during the 1-2h scrape window can
+          # make this rebase conflict; the old `|| true` swallowed the
+          # conflict, the push then failed non-fast-forward, and the ephemeral
+          # runner was destroyed with the week's captured delta aboard. Fail
+          # LOUDLY instead: abort the rebase and fail the run — the failure
+          # issue opens, and next week's run re-captures everything (scrapes
+          # are dedup/resumable, captures are idempotent).
+          if ! git pull --rebase "https://x-access-token:${GH_TOKEN}@github.com/wesisad5/aix-studio-scraper.git" main; then
+            echo "::error::data repo advanced mid-run — rebase conflict. Aborting rebase; the weekly delta is re-capturable next run (idempotent scripts, dedup'd scrapes)."
+            git rebase --abort 2>/dev/null || true
+            exit 1
+          fi
           git push "https://x-access-token:${GH_TOKEN}@github.com/wesisad5/aix-studio-scraper.git" main
 
       - name: Sync media thumbs to GH repo (Git data API, no checkout)
         env:
           GH_TOKEN: ${{ secrets.THUMBS_REPO_PAT }}
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
         run: |
           # wesisad5/aix-media-thumbs — WebP thumb cache served from
           # raw.githubusercontent. Exit 3 = backlog remains (catch-up mode),
           # only exit 1 is a failure.
+          # A6-P2-4: the Netlify ops executor (ops.sh) pushes to the SAME
+          # thumbs repo with the same script; a concurrent ref move between
+          # the pusher's GET and PATCH 422-crashes one writer. Take the
+          # thumbs-push-lock advisory lock (vault-0 `ops` store); if the ops
+          # executor holds it, DEFER (success-with-notice — backlog mode, no
+          # data loss). Lock script rides in from the data repo via the sync
+          # step; until it lands there, proceed unlocked with a warning.
+          if [ -f scripts/blob_sync_lock.py ] && [ -n "${NETLIFY_AUTH_TOKEN:-}" ]; then
+            VAULT0=$(python3 -c "import json; print(json.load(open('data/media_shards.json'))['shards'][0]['id'])")
+            LOCK_SCRIPT="$(pwd)/scripts/blob_sync_lock.py"
+            if python3 "$LOCK_SCRIPT" acquire --site "$VAULT0" --key thumbs-push-lock --holder gha-weekly; then
+              trap 'python3 "$LOCK_SCRIPT" release --site "$VAULT0" --key thumbs-push-lock --holder gha-weekly || true' EXIT
+              echo "thumbs-push-lock acquired (holder gha-weekly)"
+            else
+              LRC=$?
+              if [ "$LRC" = "3" ]; then
+                echo "::notice::thumbs-push-lock held by the Netlify ops executor — deferring thumbs sync to it (backlog, no data loss)"
+                exit 0
+              fi
+              echo "::warning::thumbs lock acquire rc=$LRC — proceeding without lock (best-effort advisory lock)"
+            fi
+          else
+            echo "::warning::blob_sync_lock.py or NETLIFY_AUTH_TOKEN unavailable — thumbs sync proceeds without lock"
+          fi
           set +e
           python3 scripts/aix_thumbs_push_ghapi.py \
             --manifest data/download/aixstudio/media_manifest.json \
@@ -172,6 +212,33 @@ jobs:
           if [ -z "$NETLIFY_AUTH_TOKEN" ]; then
             echo "::warning::NETLIFY_AUTH_TOKEN not set — skipping blob sync"
             exit 0
+          fi
+          # A6-P1-1: advisory lock on vault-0's `ops` store — the Netlify ops
+          # executor (ops.sh) runs the SAME deterministic least-filled-shard
+          # writer (aix_media_queue -> aix_blob_shards -> blob-sync.mjs); two
+          # concurrent writers are blind to each other's done-set and clobber
+          # the shard index last-writer-wins (round-5 class). Take the lock
+          # BEFORE the plan (the chooser reads shard indexes); if the ops
+          # executor holds it, skip with a notice (deferred — content-keyed
+          # blobs make next week's catch-up idempotent, so no data loss and
+          # the run stays green). Script rides in from the data repo via the
+          # sync step; until it lands there, proceed unlocked with a warning.
+          if [ ! -f scripts/blob_sync_lock.py ]; then
+            echo "::warning::scripts/blob_sync_lock.py missing (data repo pre-fix) — proceeding without lock"
+          else
+            VAULT0=$(python3 -c "import json; print(json.load(open('data/media_shards.json'))['shards'][0]['id'])")
+            LOCK_SCRIPT="$(pwd)/scripts/blob_sync_lock.py"
+            if python3 "$LOCK_SCRIPT" acquire --site "$VAULT0" --key blob-sync-lock --holder gha-weekly; then
+              trap 'python3 "$LOCK_SCRIPT" release --site "$VAULT0" --key blob-sync-lock --holder gha-weekly || true' EXIT
+              echo "blob-sync-lock acquired (holder gha-weekly)"
+            else
+              LRC=$?
+              if [ "$LRC" = "3" ]; then
+                echo "::notice::blob-sync-lock held by the Netlify ops executor — skipping blob sync this run (deferred, no data loss)"
+                exit 0
+              fi
+              echo "::warning::blob lock acquire rc=$LRC — proceeding without lock (best-effort advisory lock)"
+            fi
           fi
           # images-first queue (videos excluded — the CDN has no working
           # low-res transcode; already-synced videos keep serving from
@@ -246,8 +313,15 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # A6-P3-2: a heartbeat failure must not silently kill the cron lifeline
+    # (GitHub disables schedules after 60 days without a commit) — the issue
+    # step below pages the same label as scrape failures. continue-on-error
+    # keeps a heartbeat-only failure from reddening the whole run: by then
+    # the scrape has already succeeded.
+    continue-on-error: true
     permissions:
       contents: write
+      issues: write
     steps:
       - name: Commit heartbeat via contents API (no checkout)
         env:
@@ -272,3 +346,21 @@ jobs:
             -d "$BODY")
           echo "heartbeat http: $HTTP"; head -c 200 /tmp/hb.json; echo
           [ "$HTTP" = "200" ] || [ "$HTTP" = "201" ]
+
+      - name: Open issue on heartbeat failure
+        # A6-P3-2: mirrors the scrape job's failure-issue pattern — without
+        # this, a heartbeat death (API change, permissions regression) was
+        # invisible until GitHub silently disabled the cron 60 days later.
+        if: failure()
+        uses: actions/github-script@v7
+        env:
+          SCRAPE_RESULT: ${{ needs.scrape.result }}
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Weekly heartbeat failed (${new Date().toISOString().slice(0, 10)})`,
+              body: `The heartbeat commit (cron keepalive) failed — this repo's scheduled workflow is at risk: GitHub disables crons after 60 days without a commit.\n\nRun logs: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nThe scrape itself may have succeeded (result: ${process.env.SCRAPE_RESULT}); this failure is the cron lifeline only. Check the contents-API PUT (token scopes, .github/last-run.json).`,
+              labels: ['scrape-failure']
+            });
