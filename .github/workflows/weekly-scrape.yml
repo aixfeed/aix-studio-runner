@@ -2,8 +2,12 @@ name: Weekly AIX Scrape
 
 on:
   schedule:
-    - cron: '0 3 * * 1'   # every Monday 03:00 UTC
-  workflow_dispatch:       # manual trigger for verification
+    - cron: '0 15 * * 1'  # Monday 15:00 UTC — CATCH-UP slot (+12h after the
+                          # 03:00 Netlify scrape; round-10 migration moved the
+                          # primary weekly run to Netlify remote builds — see
+                          # netlify-trigger.yml. This run only executes when
+                          # the Netlify scrape was stale/failed/partial.)
+  workflow_dispatch:       # manual trigger for verification / DR
 
 permissions:
   contents: read           # runner repo: code only, no push needed
@@ -18,10 +22,52 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
+      - name: Gate — skip when the Netlify scrape this week was clean
+        id: gate
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          VAULT0_SITE_ID: ${{ secrets.NETLIFY_VAULT0_SITE_ID }}
+        run: |
+          set -u
+          STATUS_JSON=$(curl -s --max-time 30 \
+            -H "Authorization: Bearer $NETLIFY_AUTH_TOKEN" \
+            "https://api.netlify.com/api/v1/blobs/$VAULT0_SITE_ID/site:ops/scrape-status" || echo "")
+          if [ -z "$STATUS_JSON" ] || ! echo "$STATUS_JSON" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+            echo "scrape-status unreadable — RUNNING the catch-up"
+            exit 0
+          fi
+          VERDICT=$(printf '%s' "$STATUS_JSON" | python3 -c '
+            import json, sys, datetime
+            d = json.load(sys.stdin)
+            ts = d.get("ts", "")
+            age_h = 999
+            if ts:
+                t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                age_h = (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds() / 3600
+            rc = d.get("rc", 99)
+            partial = d.get("partial")
+            deferred = d.get("deferred")
+            fresh = age_h <= 36
+            # rc=0 ONLY counts as clean: rc=2 (a suite step failed; data was
+            # still captured+pushed) triggers this GHA catch-up so the failed
+            # batches retry same-day with the 150-min budget — persistent
+            # failures then go red HERE and open the issue (loud path).
+            clean = fresh and rc == 0 and partial not in (1, "1", True) and not deferred
+            print(f"CLEAN age={age_h:.1f}h rc={rc} partial={partial}" if clean else f"RUN age={age_h:.1f}h rc={rc} partial={partial} deferred={deferred}")
+            ' || echo "RUN parse-error")
+          echo "netlify scrape verdict: $VERDICT"
+          case "$VERDICT" in
+            CLEAN*) echo "Netlify scrape this week was clean — skipping the GHA catch-up"; exit 1 ;;
+            *)      exit 0 ;;
+          esac
+        continue-on-error: true   # gate "failure" = clean skip; job result stays green
+
       - name: Checkout runner repo (pipeline code)
+        if: steps.gate.outcome == 'success'
         uses: actions/checkout@v4
 
       - name: Clone data repo (data + resume state)
+        if: steps.gate.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.DATA_REPO_PAT }}
         run: |
@@ -29,41 +75,58 @@ jobs:
           echo "data repo HEAD: $(git -C data log --oneline -1)"
 
       - name: Sync pipeline code FROM data repo (data repo = source of truth)
+        if: steps.gate.outcome == 'success'
         run: |
-          # The data repo carries the authoritative pipeline code (developed
-          # and tested locally, pushed with each fix). Syncing runner->data
-          # caused the 2026-09-15 revert: a run dispatched before a script fix
-          # reached this repo clobbered the fixed builders in the data repo.
-          # Direction is now data->runner: the runner executes whatever main
-          # has, and never writes scripts back into the data repo.
-          # A6-P2-2: clean BEFORE copying — `cp -f` alone never deletes, so a
-          # script removed/renamed in the data repo kept executing here
-          # silently with stale semantics. Deletions must propagate.
           rm -f scripts/*.py run.sh
           cp -f data/scripts/*.py scripts/
           cp -f data/run.sh . 2>/dev/null || true
-          # netlify-vault project (media blob sync build plugin) rides along
           rm -rf netlify-vault && mkdir -p netlify-vault
           cp -rf data/mini-services/netlify-vault/* netlify-vault/ 2>/dev/null || true
           echo "pipeline code synced from data repo @ $(git -C data rev-parse --short HEAD)"
 
+      - name: Acquire scrape-lock (defer to a live Netlify / manual scrape)
+        if: steps.gate.outcome == 'success'
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+        run: |
+          if [ ! -f scripts/blob_sync_lock.py ] || [ -z "${NETLIFY_AUTH_TOKEN:-}" ]; then
+            echo "::warning::lock script/token unavailable — proceeding unlocked"
+            exit 0
+          fi
+          VAULT0=$(python3 -c "import json; print(json.load(open('data/media_shards.json'))['shards'][0]['id'])")
+          if python3 scripts/blob_sync_lock.py acquire --site "$VAULT0" --key scrape-lock --holder gha-catchup --ttl 3600; then
+            echo "scrape-lock acquired (holder gha-catchup)"
+          else
+            LRC=$?
+            if [ "$LRC" = "3" ]; then
+              echo "::notice::scrape-lock held by the Netlify executor — a scrape is live right now; deferring this catch-up (locks + dedup make next Monday's run complete)"
+              echo "SCRAPE_SKIP=1" >> "$GITHUB_ENV"
+            else
+              echo "::warning::lock acquire rc=$LRC — proceeding unlocked (best-effort)"
+            fi
+          fi
+
       - name: Set up Python
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Cache Playwright browsers
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-chromium-${{ runner.os }}-v1
 
       - name: Install Playwright + Chromium
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         run: |
           pip install playwright
           python -m playwright install chromium --with-deps
 
       - name: Write AIX auth token
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         env:
           AIX_TOKEN: ${{ secrets.AIX_TOKEN }}
         run: |
@@ -73,48 +136,56 @@ jobs:
           printf '%s' "$AIX_TOKEN" > data/scripts/.aix_token
 
       - name: Transport smoke test (fail fast on WAF / site down)
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         env:
           AIX_BASE: ${{ github.workspace }}/data
           AIX_TRANSPORT: playwright
         run: python3 scripts/aix_transport.py
 
       - name: Scrape public catalogs (gallery, flows, assets, ...)
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         env:
           AIX_BASE: ${{ github.workspace }}/data
           AIX_TRANSPORT: playwright
         run: python3 scripts/aix_scraper.py
 
       - name: Auth scrape (canvas graphs + gated libraries)
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         env:
           AIX_BASE: ${{ github.workspace }}/data
           AIX_TRANSPORT: playwright
         run: python3 scripts/aix_auth_scrape.py
 
       - name: Prism tag sweep (style_materials taxonomy)
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         env:
           AIX_BASE: ${{ github.workspace }}/data
           AIX_TRANSPORT: playwright
         run: python3 scripts/aix_prism_tags.py
 
       - name: Lib detail sweep (character/prop/scene /detail enrichment)
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         env:
           AIX_BASE: ${{ github.workspace }}/data
           AIX_TRANSPORT: playwright
         run: python3 scripts/aix_lib_details.py
 
       - name: Aux (comments + taxonomies)
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         env:
           AIX_BASE: ${{ github.workspace }}/data
           AIX_TRANSPORT: playwright
         run: python3 scripts/aix_aux.py
 
       - name: Enrich (creator profiles)
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         env:
           AIX_BASE: ${{ github.workspace }}/data
           AIX_TRANSPORT: playwright
         run: python3 scripts/aix_enrich.py
 
       - name: Finalize + rebuild catalogs
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         env:
           AIX_BASE: ${{ github.workspace }}/data
         run: |
@@ -124,11 +195,13 @@ jobs:
           python3 scripts/aix_media_manifest.py
 
       - name: Validate (pre-push data gate)
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         env:
           AIX_BASE: ${{ github.workspace }}/data
         run: python3 scripts/aix_validate.py
 
       - name: Commit and push data repo
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         env:
           GH_TOKEN: ${{ secrets.DATA_REPO_PAT }}
         run: |
@@ -143,34 +216,23 @@ jobs:
           TOTAL=$(python3 -c "import json;print(sum(json.load(open('src/data/catalog/index.json'))['counts'].values()))")
           GALLERY=$(python3 -c "import json;print(json.load(open('src/data/catalog/index.json'))['counts']['showcases'])")
           FLOWS=$(python3 -c "import json;print(json.load(open('src/data/catalog/index.json'))['counts']['workflows'])")
-          git commit -m "weekly scrape $(date -u '+%Y-%m-%d %H:%M UTC'): ${TOTAL} records (gallery ${GALLERY}, workflows ${FLOWS})"
-          # A6-P2-3: a push to the data repo during the 1-2h scrape window can
-          # make this rebase conflict; the old `|| true` swallowed the
-          # conflict, the push then failed non-fast-forward, and the ephemeral
-          # runner was destroyed with the week's captured delta aboard. Fail
-          # LOUDLY instead: abort the rebase and fail the run — the failure
-          # issue opens, and next week's run re-captures everything (scrapes
-          # are dedup/resumable, captures are idempotent).
+          git commit -m "weekly scrape (GHA catch-up) $(date -u '+%Y-%m-%d %H:%M UTC'): ${TOTAL} records (gallery ${GALLERY}, workflows ${FLOWS})"
           if ! git pull --rebase "https://x-access-token:${GH_TOKEN}@github.com/wesisad5/aix-studio-scraper.git" main; then
-            echo "::error::data repo advanced mid-run — rebase conflict. Aborting rebase; the weekly delta is re-capturable next run (idempotent scripts, dedup'd scrapes)."
+            echo "::error::data repo advanced mid-run — rebase conflict. Aborting rebase; the delta is re-capturable next run (idempotent scripts, dedup'd scrapes)."
             git rebase --abort 2>/dev/null || true
             exit 1
           fi
           git push "https://x-access-token:${GH_TOKEN}@github.com/wesisad5/aix-studio-scraper.git" main
 
       - name: Sync media thumbs to GH repo (Git data API, no checkout)
+        if: ${{ !cancelled() && steps.gate.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ secrets.THUMBS_REPO_PAT }}
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
         run: |
-          # wesisad5/aix-media-thumbs — WebP thumb cache served from
-          # raw.githubusercontent. Exit 3 = backlog remains (catch-up mode),
-          # only exit 1 is a failure.
-          # A6-P2-4: the Netlify ops executor (ops.sh) pushes to the SAME
-          # Netlify thumbs store; concurrent index writes clobber (round-5
-          # class). Take the thumbs-push-lock advisory lock (vault-0 `ops`
-          # store); if the ops executor holds it, DEFER (success-with-notice
-          # — backlog mode, no data loss).
+          # ROUND-9 CUTOVER: thumbs land on the NETLIFY thumbs blob store
+          # (aix-media-thumbs site) — the GH thumbs repo is FROZEN and serves
+          # only as the route's fallback tier.
           if [ -f scripts/blob_sync_lock.py ] && [ -n "${NETLIFY_AUTH_TOKEN:-}" ]; then
             VAULT0=$(python3 -c "import json; print(json.load(open('data/media_shards.json'))['shards'][0]['id'])")
             LOCK_SCRIPT="$(pwd)/scripts/blob_sync_lock.py"
@@ -180,19 +242,12 @@ jobs:
             else
               LRC=$?
               if [ "$LRC" = "3" ]; then
-                echo "::notice::thumbs-push-lock held by the Netlify ops executor — deferring thumbs sync to it (backlog, no data loss)"
+                echo "::notice::thumbs-push-lock held by another executor — deferring thumbs sync (backlog, no data loss)"
                 exit 0
               fi
               echo "::warning::thumbs lock acquire rc=$LRC — proceeding without lock (best-effort advisory lock)"
             fi
-          else
-            echo "::warning::blob_sync_lock.py or NETLIFY_AUTH_TOKEN unavailable — thumbs sync proceeds without lock"
           fi
-          # ROUND-9 CUTOVER: thumbs now land on the NETLIFY thumbs blob store
-          # (aix-media-thumbs site) — the GH thumbs repo is FROZEN at the
-          # pre-migration corpus and serves only as the route's fallback tier.
-          # Same queue semantics, same 3-strike skips, same exit contract.
-          # timeout guard: 124 (timeout) remapped to 3 = backlog remains.
           set +e
           timeout --signal=TERM --kill-after=30 2700 \
             env THUMBS_SITE_ID=75c01060-e863-4377-bbed-820ce64fafac \
@@ -204,14 +259,10 @@ jobs:
           [ "$rc" = "124" ] && rc=3
           set -e
           echo "thumbs sync rc=$rc"
-          # whitelist 0 (complete) / 3 (backlog remains); anything else
-          # (1 error, 2 argparse, 137 kill) is a failure
           [ "$rc" = "0" ] || [ "$rc" = "3" ] || exit 1
 
       - name: Sync full-res media to Netlify Blobs (sharded, direct SDK writes)
-        # decoupled from thumbs success (runs 18/19 lesson: a thumbs failure
-        # must not skip the blob chunk too — they are independent stores)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.gate.outcome == 'success' }}
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
         run: |
@@ -219,18 +270,8 @@ jobs:
             echo "::warning::NETLIFY_AUTH_TOKEN not set — skipping blob sync"
             exit 0
           fi
-          # A6-P1-1: advisory lock on vault-0's `ops` store — the Netlify ops
-          # executor (ops.sh) runs the SAME deterministic least-filled-shard
-          # writer (aix_media_queue -> aix_blob_shards -> blob-sync.mjs); two
-          # concurrent writers are blind to each other's done-set and clobber
-          # the shard index last-writer-wins (round-5 class). Take the lock
-          # BEFORE the plan (the chooser reads shard indexes); if the ops
-          # executor holds it, skip with a notice (deferred — content-keyed
-          # blobs make next week's catch-up idempotent, so no data loss and
-          # the run stays green). Script rides in from the data repo via the
-          # sync step; until it lands there, proceed unlocked with a warning.
           if [ ! -f scripts/blob_sync_lock.py ]; then
-            echo "::warning::scripts/blob_sync_lock.py missing (data repo pre-fix) — proceeding without lock"
+            echo "::warning::scripts/blob_sync_lock.py missing — proceeding without lock"
           else
             VAULT0=$(python3 -c "import json; print(json.load(open('data/media_shards.json'))['shards'][0]['id'])")
             LOCK_SCRIPT="$(pwd)/scripts/blob_sync_lock.py"
@@ -240,36 +281,22 @@ jobs:
             else
               LRC=$?
               if [ "$LRC" = "3" ]; then
-                echo "::notice::blob-sync-lock held by the Netlify ops executor — skipping blob sync this run (deferred, no data loss)"
+                echo "::notice::blob-sync-lock held by another executor — skipping blob sync this run (deferred, no data loss)"
                 exit 0
               fi
               echo "::warning::blob lock acquire rc=$LRC — proceeding without lock (best-effort advisory lock)"
             fi
           fi
-          # images-first queue (videos excluded — the CDN has no working
-          # low-res transcode; already-synced videos keep serving from
-          # shard-0). P0 covers -> P1 gallery -> P2 canvas -> P3 audio ->
-          # P4 avatars.
           python3 scripts/aix_media_queue.py \
             --manifest data/download/aixstudio/media_manifest.json \
             --catalog data/src/data/catalog \
             --out /tmp/media-queue-full.json
-          # shard plan: fetch every shard's index, pick the least-filled
-          # under target_bytes_per_shard (per-project-cap hedge; all shards
-          # stay DRAFT — preview deploys only, never production)
           python3 scripts/aix_blob_shards.py \
             --registry data/media_shards.json \
             --out /tmp/shard-plan.json \
             --merged-out /tmp/blob-merged-index.json
           TARGET_SITE=$(python3 -c "import json; print(json.load(open('/tmp/shard-plan.json'))['target']['id'])")
           echo "upload target shard: $TARGET_SITE"
-          # 2026-09-17: getStore({name, siteID, token}) performs WRITES with
-          # a plain user PAT — no netlify deploy / build plugin needed
-          # anymore. Works from any Node environment (this public runner has
-          # free unlimited minutes; the sandbox and any machine are
-          # fallbacks — the "leverage Netlify beyond GHA" hedge).
-          # connectivity preflight: the CN CDN occasionally stalls runner
-          # IPs (WAF); surface reachability in the log before the sync
           PROBE=$(python3 -c "import json; print(json.load(open('/tmp/media-queue-full.json'))[0]['url'])")
           curl -s -o /dev/null --max-time 30 -w "OSS probe: HTTP %{http_code} in %{time_total}s\n" \
             -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" -I "$PROBE" || true
@@ -309,21 +336,12 @@ jobs:
 
   heartbeat:
     # Keeps THIS repo's scheduled cron alive: GitHub auto-disables cron
-    # workflows in repos with 60 days of no activity, and the runner repo
-    # receives no other commits in steady state. One tiny commit per weekly
-    # run makes the primary schedule self-sustaining. (The data-repo
-    # "Weekly trigger (keepalive)" backup is belt-and-braces — it is
-    # currently blocked by a private-repo Actions startup_failure, root
-    # cause under investigation; see aix-studio-scraper worklog round-7.)
+    # workflows in repos with 60 days of no activity. One tiny commit per
+    # weekly run makes the schedule self-sustaining.
     needs: scrape
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # A6-P3-2: a heartbeat failure must not silently kill the cron lifeline
-    # (GitHub disables schedules after 60 days without a commit) — the issue
-    # step below pages the same label as scrape failures. continue-on-error
-    # keeps a heartbeat-only failure from reddening the whole run: by then
-    # the scrape has already succeeded.
     continue-on-error: true
     permissions:
       contents: write
@@ -354,9 +372,6 @@ jobs:
           [ "$HTTP" = "200" ] || [ "$HTTP" = "201" ]
 
       - name: Open issue on heartbeat failure
-        # A6-P3-2: mirrors the scrape job's failure-issue pattern — without
-        # this, a heartbeat death (API change, permissions regression) was
-        # invisible until GitHub silently disabled the cron 60 days later.
         if: failure()
         uses: actions/github-script@v7
         env:
