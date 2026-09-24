@@ -25,49 +25,67 @@ jobs:
           SCRAPE_HOOK_URL: ${{ secrets.NETLIFY_SCRAPE_HOOK_URL }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -u
-          # --- 1. freshness + rc check on the LAST scrape-status blob -------
-          # Review round-10: rc-only checks miss every silent failure (trigger
-          # death, hook POST failure, title-less no-op, minutes exhaustion,
-          # 15-min hard kill) — all leave the blob STALE-but-green. A blob
-          # older than 8 days, a non-zero rc, or a missing blob = problem.
-          STALE_OR_FAILED=0
-          DETAIL="unreadable"
-          STATUS_JSON=$(curl -s --max-time 30 \
-            -H "Authorization: Bearer $NETLIFY_AUTH_TOKEN" \
-            "https://api.netlify.com/api/v1/blobs/$VAULT0_SITE_ID/site:ops/scrape-status" || echo "")
-          if [ -n "$STATUS_JSON" ] && echo "$STATUS_JSON" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
-            DETAIL=$(printf '%s' "$STATUS_JSON" | python3 -c '
-              import json, sys, datetime
-              d = json.load(sys.stdin)
+          # V2-F2 fixes (verified broken by audit round-10): the inline
+          # `python3 -c` block was unreachable (IndentationError + f-string
+          # SyntaxError), `|| true` inside $() zeroed the rc, and a missing
+          # blob defaulted healthy. Heredoc-file python, plain rc capture,
+          # missing/unparsable => STALE (fail-loud).
+          cat > /tmp/check_status.py <<'PYEOF'
+          import datetime, json, sys, urllib.request
+          token, site = sys.argv[1], sys.argv[2]
+          try:
+              req = urllib.request.Request(
+                  "https://api.netlify.com/api/v1/blobs/%s/site:ops/scrape-status" % site,
+                  headers={"Authorization": "Bearer " + token})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  d = json.loads(r.read())
               ts = d.get("ts", "")
               age_days = 99
               if ts:
                   t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
                   age_days = (datetime.datetime.now(datetime.timezone.utc) - t).days
               rc = d.get("rc", 99)
-              print(f"ts={ts} age={age_days}d rc={rc} partial={d.get(\"partial\")} chain_http={d.get(\"chain_http\")}")
-              sys.exit(0 if (age_days <= 8 and rc in (0, 2)) else 1)
-              ' || true)
-            STALE_OR_FAILED=$?
-            [ "$STALE_OR_FAILED" != "0" ] && STALE_OR_FAILED=1 || STALE_OR_FAILED=0
-          fi
-          echo "last scrape status: $DETAIL (stale_or_failed=$STALE_OR_FAILED)"
-          if [ "$STALE_OR_FAILED" = "1" ]; then
-            # page now, still fire — this week's run may heal it
+              ok = age_days <= 8 and rc in (0, 2)
+              print("ts=%s age=%dd rc=%s partial=%s chain_http=%s" % (
+                  ts, age_days, rc, d.get("partial"), d.get("chain_http")))
+              sys.exit(0 if ok else 1)
+          except SystemExit:
+              raise
+          except Exception as e:
+              print("unreadable: %s" % str(e)[:120])
+              sys.exit(1)
+          PYEOF
+          DETAIL=$(python3 /tmp/check_status.py "$NETLIFY_AUTH_TOKEN" "$VAULT0_SITE_ID" 2>&1)
+          CHECK_RC=$?
+          echo "last scrape status: $DETAIL (check_rc=$CHECK_RC)"
+          if [ "$CHECK_RC" != "0" ]; then
+            # page now, still fire — this week's run may heal it. V2-P3: the
+            # detail goes in via env + json.dumps (no shell interpolation into
+            # python source — blob content cannot break/inject the payload).
+            ISSUE_DETAIL="$DETAIL" python3 - <<'PYEOF'
+          import json, os
+          body = {
+              "title": "Netlify scrape stale/failed",
+              "body": ("The scrape-status blob is stale (>8d) or failed. "
+                       "Last status: %s\n\nThe weekly Netlify scrape did not "
+                       "complete cleanly. Check https://app.netlify.com/sites/"
+                       "aix-media-ops/builds (last scrape-mode build), the "
+                       "build-minutes budget, and whether the trigger fired "
+                       "the hook. This issue was opened by the Monday 03:00 "
+                       "UTC trigger check; the hook below was still fired so "
+                       "this week may self-heal.") % os.environ["ISSUE_DETAIL"],
+              "labels": ["scrape-failure"],
+          }
+          open("/tmp/issue.json", "w").write(json.dumps(body))
+          PYEOF
             curl -s --max-time 20 -X POST \
               -H "Authorization: token $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/aixfeed/aix-studio-runner/issues" \
-              -d "$(python3 -c "
-              import json
-              print(json.dumps({
-                'title': 'Netlify scrape stale/failed (last: $DETAIL)',
-                'body': 'The scrape-status blob is stale (>8d) or failed. The weekly Netlify scrape did not complete cleanly. Check: https://app.netlify.com/sites/aix-media-ops/builds (look for the last scrape-mode build), the build-minutes budget, and whether this trigger fired the hook. This issue was opened by the Monday 03:00 UTC trigger check; the hook below was still fired so this week may self-heal.',
-                'labels': ['scrape-failure']}))")" \
-              -o /tmp/issue.json -w "issue http=%{http_code}\n" || true
+              -d @/tmp/issue.json -o /tmp/issue-resp.json \
+              -w "issue http=%{http_code}\n" || true
           fi
-          # --- 2. fire the hook (title body REQUIRED: dispatch matches it) ---
+          # --- fire the hook (title body REQUIRED: dispatch matches it) ---
           CODE=$(curl -s -o /tmp/hook.json -w "%{http_code}" --max-time 30 -X POST \
             -H "Content-Type: application/json" "$SCRAPE_HOOK_URL" \
             -d '{"title":"scrape"}' || echo 000)

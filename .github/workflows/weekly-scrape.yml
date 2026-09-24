@@ -28,33 +28,42 @@ jobs:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           VAULT0_SITE_ID: ${{ secrets.NETLIFY_VAULT0_SITE_ID }}
         run: |
-          set -u
-          STATUS_JSON=$(curl -s --max-time 30 \
-            -H "Authorization: Bearer $NETLIFY_AUTH_TOKEN" \
-            "https://api.netlify.com/api/v1/blobs/$VAULT0_SITE_ID/site:ops/scrape-status" || echo "")
-          if [ -z "$STATUS_JSON" ] || ! echo "$STATUS_JSON" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
-            echo "scrape-status unreadable — RUNNING the catch-up"
-            exit 0
-          fi
-          VERDICT=$(printf '%s' "$STATUS_JSON" | python3 -c '
-            import json, sys, datetime
-            d = json.load(sys.stdin)
-            ts = d.get("ts", "")
-            age_h = 999
-            if ts:
-                t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                age_h = (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds() / 3600
-            rc = d.get("rc", 99)
-            partial = d.get("partial")
-            deferred = d.get("deferred")
-            fresh = age_h <= 36
-            # rc=0 ONLY counts as clean: rc=2 (a suite step failed; data was
-            # still captured+pushed) triggers this GHA catch-up so the failed
-            # batches retry same-day with the 150-min budget — persistent
-            # failures then go red HERE and open the issue (loud path).
-            clean = fresh and rc == 0 and partial not in (1, "1", True) and not deferred
-            print(f"CLEAN age={age_h:.1f}h rc={rc} partial={partial}" if clean else f"RUN age={age_h:.1f}h rc={rc} partial={partial} deferred={deferred}")
-            ' || echo "RUN parse-error")
+          # V2-F1 fix (verified broken by audit round-10): the inline
+          # `python3 -c` block threw IndentationError EVERY run -> verdict was
+          # always "RUN parse-error" -> this catch-up ran every Monday
+          # regardless of Netlify health. Heredoc-file python fixes it.
+          # V2-F3: fail-safe direction — ANY internal error => RUN (the
+          # catch-up is the safe direction; a crash here must never silently
+          # skip the whole week).
+          cat > /tmp/gate.py <<'PYEOF'
+          import datetime, json, sys, urllib.request
+          token, site = sys.argv[1], sys.argv[2]
+          try:
+              req = urllib.request.Request(
+                  "https://api.netlify.com/api/v1/blobs/%s/site:ops/scrape-status" % site,
+                  headers={"Authorization": "Bearer " + token})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  d = json.loads(r.read())
+              ts = d.get("ts", "")
+              age_h = 999.0
+              if ts:
+                  t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                  age_h = (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds() / 3600
+              rc = d.get("rc", 99)
+              partial = d.get("partial")
+              deferred = d.get("deferred")
+              fresh = age_h <= 36
+              # rc=0 ONLY counts as clean: rc=2 (a suite step failed; data was
+              # still captured+pushed) triggers this GHA catch-up so the failed
+              # batches retry same-day with the 150-min budget — persistent
+              # failures then go red HERE and open the issue (loud path).
+              clean = fresh and rc == 0 and partial not in (1, "1", True) and not deferred
+              detail = "age=%.1fh rc=%s partial=%s deferred=%s" % (age_h, rc, partial, deferred)
+              print(("CLEAN " if clean else "RUN ") + detail)
+          except Exception as e:
+              print("RUN unreadable: %s" % str(e)[:120])
+          PYEOF
+          VERDICT=$(python3 /tmp/gate.py "$NETLIFY_AUTH_TOKEN" "$VAULT0_SITE_ID" 2>&1 || echo "RUN internal-error")
           echo "netlify scrape verdict: $VERDICT"
           case "$VERDICT" in
             CLEAN*) echo "Netlify scrape this week was clean — skipping the GHA catch-up"; exit 1 ;;
@@ -86,6 +95,7 @@ jobs:
 
       - name: Acquire scrape-lock (defer to a live Netlify / manual scrape)
         if: steps.gate.outcome == 'success'
+        id: scrape_lock
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
         run: |
@@ -105,6 +115,18 @@ jobs:
               echo "::warning::lock acquire rc=$LRC — proceeding unlocked (best-effort)"
             fi
           fi
+
+      - name: Release scrape-lock (V1-P3 — the catch-up never released it)
+        if: always() && steps.gate.outcome == 'success'
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+        run: |
+          [ -f scripts/blob_sync_lock.py ] && [ -n "${NETLIFY_AUTH_TOKEN:-}" ] || exit 0
+          VAULT0=$(python3 -c "import json; print(json.load(open('data/media_shards.json'))['shards'][0]['id'])" 2>/dev/null || echo "")
+          [ -n "$VAULT0" ] || exit 0
+          python3 scripts/blob_sync_lock.py release --site "$VAULT0" --key scrape-lock --holder gha-catchup \
+            && echo "scrape-lock released" \
+            || echo "scrape-lock release: not held by us (fine)"
 
       - name: Set up Python
         if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
