@@ -1,12 +1,17 @@
-name: Weekly AIX Scrape
+name: AIX scrape catch-up (DR)
 
 on:
   schedule:
-    - cron: '0 15 * * 1'  # Monday 15:00 UTC — CATCH-UP slot (+12h after the
-                          # 03:00 Netlify scrape; round-10 migration moved the
-                          # primary weekly run to Netlify remote builds — see
-                          # netlify-trigger.yml. This run only executes when
-                          # the Netlify scrape was stale/failed/partial.)
+    - cron: '0 15 * * *'  # DAILY 15:00 UTC catch-up slot (round-11: the
+                          # Netlify scrape is now DAILY at ~03:00-09:30 UTC
+                          # — GitHub scheduler delay — so this DR slot is
+                          # daily too). Runs the full GHA pipeline ONLY when
+                          # the Netlify scrape actually FAILED (rc 1/4,
+                          # stale >36h, missing/garbage). rc=2 busy-code
+                          # partials NO LONGER trigger it: with daily cadence
+                          # the next day's id-dedup scrape self-heals them —
+                          # and a site-wide busy day used to fail BOTH
+                          # executors (observed 2026-09-28).
   workflow_dispatch:       # manual trigger for verification / DR
 
 permissions:
@@ -22,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
-      - name: Gate — skip when the Netlify scrape this week was clean
+      - name: Gate — skip when the Netlify scrape was healthy
         id: gate
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
@@ -35,6 +40,10 @@ jobs:
           # V2-F3: fail-safe direction — ANY internal error => RUN (the
           # catch-up is the safe direction; a crash here must never silently
           # skip the whole week).
+          # ROUND-11 semantics: rc=2 (busy-code partial, data pushed) is now
+          # CLEAN for this gate — daily cadence self-heals partials next run;
+          # the catch-up reserves its 150-min budget for real failures
+          # (rc=1 fatal / rc=4 drift-high / stale / missing / garbage).
           cat > /tmp/gate.py <<'PYEOF'
           import datetime, json, sys, urllib.request
           token, site = sys.argv[1], sys.argv[2]
@@ -52,13 +61,11 @@ jobs:
               rc = d.get("rc", 99)
               partial = d.get("partial")
               deferred = d.get("deferred")
+              drift = d.get("drift")
               fresh = age_h <= 36
-              # rc=0 ONLY counts as clean: rc=2 (a suite step failed; data was
-              # still captured+pushed) triggers this GHA catch-up so the failed
-              # batches retry same-day with the 150-min budget — persistent
-              # failures then go red HERE and open the issue (loud path).
-              clean = fresh and rc == 0 and partial not in (1, "1", True) and not deferred
-              detail = "age=%.1fh rc=%s partial=%s deferred=%s" % (age_h, rc, partial, deferred)
+              clean = fresh and rc in (0, 2) and not deferred
+              detail = "age=%.1fh rc=%s partial=%s deferred=%s drift=%s/%s" % (
+                  age_h, rc, partial, deferred, drift, d.get("drift_findings"))
               print(("CLEAN " if clean else "RUN ") + detail)
           except Exception as e:
               print("RUN unreadable: %s" % str(e)[:120])
@@ -66,7 +73,7 @@ jobs:
           VERDICT=$(python3 /tmp/gate.py "$NETLIFY_AUTH_TOKEN" "$VAULT0_SITE_ID" 2>&1 || echo "RUN internal-error")
           echo "netlify scrape verdict: $VERDICT"
           case "$VERDICT" in
-            CLEAN*) echo "Netlify scrape this week was clean — skipping the GHA catch-up"; exit 1 ;;
+            CLEAN*) echo "Netlify scrape healthy (or busy-code partial that self-heals daily) — skipping the GHA catch-up"; exit 1 ;;
             *)      exit 0 ;;
           esac
         continue-on-error: true   # gate "failure" = clean skip; job result stays green
@@ -171,6 +178,20 @@ jobs:
           AIX_TRANSPORT: playwright
         run: python3 scripts/aix_scraper.py
 
+      - name: Scrape material library (round-11 — 34.5K user-draw materials)
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
+        env:
+          AIX_BASE: ${{ github.workspace }}/data
+          AIX_TRANSPORT: playwright
+        run: python3 scripts/aix_material_scrape.py
+
+      - name: Scrape new content (skills, contests, taxonomies)
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
+        env:
+          AIX_BASE: ${{ github.workspace }}/data
+          AIX_TRANSPORT: playwright
+        run: python3 scripts/aix_newcontent_scrape.py
+
       - name: Auth scrape (canvas graphs + gated libraries)
         if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
         env:
@@ -221,6 +242,41 @@ jobs:
         env:
           AIX_BASE: ${{ github.workspace }}/data
         run: python3 scripts/aix_validate.py
+
+      - name: Drift validation (round-11 — schema pins vs fresh corpus)
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
+        env:
+          AIX_BASE: ${{ github.workspace }}/data
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          VAULT0_SITE_ID: ${{ secrets.NETLIFY_VAULT0_SITE_ID }}
+        run: |
+          # advisory findings ride along (exit 0); HIGH (exit 4) blocks the
+          # push below — same contract as scrape.sh step 8.5. Report also
+          # lands in the vault-0 ops blob "drift-report".
+          set +e
+          OUT=$(python3 scripts/aix_drift_validator.py 2>&1); RC=$?
+          set -e
+          echo "$OUT" | tail -8
+          SUMMARY=$(echo "$OUT" | grep -o 'DRIFT_SUMMARY: .*' | head -1 || true)
+          echo "drift: $SUMMARY"
+          if [ -f data/download/aixstudio/drift_report.json ]; then
+            python3 - "$NETLIFY_AUTH_TOKEN" "$VAULT0_SITE_ID" data/download/aixstudio/drift_report.json <<'PUTEOF'
+          import sys, urllib.request
+          token, site, path = sys.argv[1], sys.argv[2], sys.argv[3]
+          try:
+              body = open(path, "rb").read()
+              req = urllib.request.Request(
+                  "https://api.netlify.com/api/v1/blobs/%s/site:ops/drift-report" % site,
+                  data=body, method="PUT",
+                  headers={"Authorization": "Bearer " + token,
+                           "Content-Type": "application/octet-stream"})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  print("drift report PUT ->", r.status)
+          except Exception as e:
+              print("drift report PUT failed (non-fatal):", e)
+          PUTEOF
+          fi
+          exit $RC
 
       - name: Commit and push data repo
         if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'

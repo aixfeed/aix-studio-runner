@@ -2,7 +2,11 @@ name: Netlify scrape trigger
 
 on:
   schedule:
-    - cron: '0 3 * * 1'   # Monday 03:00 UTC — fires the Netlify scrape build
+    - cron: '0 3 * * *'   # DAILY 03:00 UTC (round-11: daily cadence — site
+                          # adds ~100 records/day; GitHub scheduler delays
+                          # top-of-hour fires by minutes-to-hours, observed
+                          # 03:00 -> 09:32 on 2026-09-28 — freshness window
+                          # is 36h to absorb it) — fires the Netlify scrape
   workflow_dispatch:
 
 permissions:
@@ -18,18 +22,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Check last scrape status (freshness + rc), then fire the Netlify hook
+      - name: Check last scrape status (freshness + rc + drift), check build budget, then fire the Netlify hook
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           VAULT0_SITE_ID: ${{ secrets.NETLIFY_VAULT0_SITE_ID }}
           SCRAPE_HOOK_URL: ${{ secrets.NETLIFY_SCRAPE_HOOK_URL }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPS_SITE_ID: 9f636436-d3c9-439b-976c-e9293e41ccd1
         run: |
           # V2-F2 fixes (verified broken by audit round-10): the inline
           # `python3 -c` block was unreachable (IndentationError + f-string
           # SyntaxError), `|| true` inside $() zeroed the rc, and a missing
           # blob defaulted healthy. Heredoc-file python, plain rc capture,
           # missing/unparsable => STALE (fail-loud).
+          # ROUND-11: freshness 8d -> 36h (daily cadence); status line now
+          # carries the drift verdict; a build-budget check joins in (legacy
+          # free plan = 300 build-min/mo; ~7min/scrape + ~7.5min/weekly-media
+          # ≈ 34 builds/mo nominal — warn >34, alert >40).
           cat > /tmp/check_status.py <<'PYEOF'
           import datetime, json, sys, urllib.request
           token, site = sys.argv[1], sys.argv[2]
@@ -40,14 +49,15 @@ jobs:
               with urllib.request.urlopen(req, timeout=30) as r:
                   d = json.loads(r.read())
               ts = d.get("ts", "")
-              age_days = 99
+              age_h = 999.0
               if ts:
                   t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                  age_days = (datetime.datetime.now(datetime.timezone.utc) - t).days
+                  age_h = (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds() / 3600
               rc = d.get("rc", 99)
-              ok = age_days <= 8 and rc in (0, 2)
-              print("ts=%s age=%dd rc=%s partial=%s chain_http=%s" % (
-                  ts, age_days, rc, d.get("partial"), d.get("chain_http")))
+              ok = age_h <= 36 and rc in (0, 2)
+              print("ts=%s age=%.1fh rc=%s partial=%s chain=%s/%s drift=%s/%s" % (
+                  ts, age_h, rc, d.get("partial"), d.get("chain_http"),
+                  d.get("chain_reason"), d.get("drift"), d.get("drift_findings")))
               sys.exit(0 if ok else 1)
           except SystemExit:
               raise
@@ -59,21 +69,21 @@ jobs:
           CHECK_RC=$?
           echo "last scrape status: $DETAIL (check_rc=$CHECK_RC)"
           if [ "$CHECK_RC" != "0" ]; then
-            # page now, still fire — this week's run may heal it. V2-P3: the
+            # page now, still fire — today's run may heal it. V2-P3: the
             # detail goes in via env + json.dumps (no shell interpolation into
             # python source — blob content cannot break/inject the payload).
             ISSUE_DETAIL="$DETAIL" python3 - <<'PYEOF'
           import json, os
           body = {
               "title": "Netlify scrape stale/failed",
-              "body": ("The scrape-status blob is stale (>8d) or failed. "
-                       "Last status: %s\n\nThe weekly Netlify scrape did not "
+              "body": ("The scrape-status blob is stale (>36h) or failed. "
+                       "Last status: %s\n\nThe daily Netlify scrape did not "
                        "complete cleanly. Check https://app.netlify.com/sites/"
                        "aix-media-ops/builds (last scrape-mode build), the "
                        "build-minutes budget, and whether the trigger fired "
-                       "the hook. This issue was opened by the Monday 03:00 "
+                       "the hook. This issue was opened by the daily 03:00 "
                        "UTC trigger check; the hook below was still fired so "
-                       "this week may self-heal.") % os.environ["ISSUE_DETAIL"],
+                       "today may self-heal.") % os.environ["ISSUE_DETAIL"],
               "labels": ["scrape-failure"],
           }
           open("/tmp/issue.json", "w").write(json.dumps(body))
@@ -85,6 +95,40 @@ jobs:
               -d @/tmp/issue.json -o /tmp/issue-resp.json \
               -w "issue http=%{http_code}\n" || true
           fi
+          # --- build-budget guard (legacy free plan: 300 build-min/mo) ---
+          BUDGET=$(BUDGET_TOKEN="$NETLIFY_AUTH_TOKEN" BUDGET_SITE="$OPS_SITE_ID" python3 - <<'PYEOF'
+          import datetime, json, os, urllib.request
+          token, site = os.environ["BUDGET_TOKEN"], os.environ["BUDGET_SITE"]
+          now = datetime.datetime.now(datetime.timezone.utc)
+          month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+          n, page = 0, 1
+          try:
+              while page <= 10:
+                  req = urllib.request.Request(
+                      "https://api.netlify.com/api/v1/sites/%s/builds?per_page=100&page=%d" % (site, page),
+                      headers={"Authorization": "Bearer " + token})
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      builds = json.loads(r.read())
+                  if not builds:
+                      break
+                  for b in builds:
+                      t = datetime.datetime.fromisoformat(b["created_at"].replace("Z", "+00:00"))
+                      if t >= month_start:
+                          n += 1
+                  page += 1
+              # nominal daily cadence ~34/mo (30 scrapes + 4.3 media)
+              print("builds_this_month=%d" % n)
+              if n > 40:
+                  print("BUDGET_ALERT: %d builds this month — projected >280 "
+                        "build-min of the 300/mo legacy plan. Check the "
+                        "builds list for runaway/looping builds." % n)
+              elif n > 34:
+                  print("BUDGET_WARN: %d builds this month (nominal ~34)" % n)
+          except Exception as e:
+              print("budget check unreadable: %s" % str(e)[:80])
+          PYEOF
+          )
+          echo "$BUDGET"
           # --- fire the hook (title body REQUIRED: dispatch matches it) ---
           CODE=$(curl -s -o /tmp/hook.json -w "%{http_code}" --max-time 30 -X POST \
             -H "Content-Type: application/json" "$SCRAPE_HOOK_URL" \
@@ -115,7 +159,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: `Netlify trigger failed (${new Date().toISOString().slice(0, 10)})`,
-              body: `The Monday trigger workflow failed — the Netlify scrape hook may not have fired. Run logs: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nCheck: NETLIFY_SCRAPE_HOOK_URL secret (rotated?), NETLIFY_AUTH_TOKEN validity, the status-blob read.`,
+              body: `The daily trigger workflow failed — the Netlify scrape hook may not have fired. Run logs: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nCheck: NETLIFY_SCRAPE_HOOK_URL secret (rotated?), NETLIFY_AUTH_TOKEN validity, the status-blob read.`,
               labels: ['scrape-failure']
             });
 
