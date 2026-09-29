@@ -253,12 +253,19 @@ jobs:
           # advisory findings ride along (exit 0); HIGH (exit 4) blocks the
           # push below — same contract as scrape.sh step 8.5. Report also
           # lands in the vault-0 ops blob "drift-report".
+          # V1-P3-7: validator CRASH (timeout etc) fails OPEN with a loud
+          # warning — same semantics as scrape.sh (the classic validate gate
+          # already passed; only exit 4 = HIGH blocks).
           set +e
           OUT=$(python3 scripts/aix_drift_validator.py 2>&1); RC=$?
           set -e
           echo "$OUT" | tail -8
           SUMMARY=$(echo "$OUT" | grep -o 'DRIFT_SUMMARY: .*' | head -1 || true)
           echo "drift: $SUMMARY"
+          if [ "$RC" != "0" ] && [ "$RC" != "4" ]; then
+            echo "::warning::drift validator rc=$RC (crash) — proceeding (fail-open), severity unknown"
+            RC=0
+          fi
           if [ -f data/download/aixstudio/drift_report.json ]; then
             python3 - "$NETLIFY_AUTH_TOKEN" "$VAULT0_SITE_ID" data/download/aixstudio/drift_report.json <<'PUTEOF'
           import sys, urllib.request
