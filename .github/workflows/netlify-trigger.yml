@@ -42,12 +42,23 @@ jobs:
           cat > /tmp/check_status.py <<'PYEOF'
           import datetime, json, sys, urllib.request
           token, site = sys.argv[1], sys.argv[2]
-          try:
+          def get_blob(key):
               req = urllib.request.Request(
-                  "https://api.netlify.com/api/v1/blobs/%s/site:ops/scrape-status" % site,
+                  "https://api.netlify.com/api/v1/blobs/%s/site:ops/%s" % (site, key),
                   headers={"Authorization": "Bearer " + token})
               with urllib.request.urlopen(req, timeout=30) as r:
-                  d = json.loads(r.read())
+                  return json.loads(r.read())
+          media_rc = None
+          media_line = "media: none yet"
+          try:
+              m = get_blob("status")
+              media_rc = m.get("thumbs_rc")
+              media_line = ("media: ts=%s thumbs_rc=%s blob=%s elapsed=%ss" % (
+                  m.get("ts", ""), media_rc, m.get("blob"), m.get("elapsed_s")))
+          except Exception as e:
+              media_line = "media: unreadable (%s)" % str(e)[:60]
+          try:
+              d = get_blob("scrape-status")
               ts = d.get("ts", "")
               age_h = 999.0
               if ts:
@@ -55,20 +66,49 @@ jobs:
                   age_h = (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds() / 3600
               rc = d.get("rc", 99)
               ok = age_h <= 36 and rc in (0, 2)
-              print("ts=%s age=%.1fh rc=%s partial=%s chain=%s/%s drift=%s/%s" % (
+              print("ts=%s age=%.1fh rc=%s partial=%s chain=%s/%s drift=%s/%s | %s" % (
                   ts, age_h, rc, d.get("partial"), d.get("chain_http"),
-                  d.get("chain_reason"), d.get("drift"), d.get("drift_findings")))
+                  d.get("chain_reason"), d.get("drift"), d.get("drift_findings"),
+                  media_line))
+              # round-12: exit 2 = scrape healthy but the MEDIA build reported
+              # a hard error (thumbs_rc 1 = error; 0/3 = complete/backlog-remains
+              # are healthy). Monitors the previously-unread media status blob
+              # (round-10 P2 residual).
+              if ok and media_rc not in (None, 0, 3):
+                  sys.exit(2)
               sys.exit(0 if ok else 1)
           except SystemExit:
               raise
           except Exception as e:
-              print("unreadable: %s" % str(e)[:120])
+              print("unreadable: %s | %s" % (str(e)[:120], media_line))
               sys.exit(1)
           PYEOF
           DETAIL=$(python3 /tmp/check_status.py "$NETLIFY_AUTH_TOKEN" "$VAULT0_SITE_ID" 2>&1)
           CHECK_RC=$?
           echo "last scrape status: $DETAIL (check_rc=$CHECK_RC)"
-          if [ "$CHECK_RC" != "0" ]; then
+          if [ "$CHECK_RC" = "2" ]; then
+            # scrape healthy, media build hard-errored — separate issue, hook
+            # still fires (scrape is independent of media).
+            ISSUE_DETAIL="$DETAIL" TITLE_PREFIX="Media build error" python3 - <<'PYEOF'
+          import json, os
+          body = {
+              "title": "Media build error (thumbs hard-fail)",
+              "body": ("The last media build reported a hard thumbs error (rc not "
+                       "0/3). Last status: %s\n\nCheck the Netlify builds list "
+                       "and the thumbs-push-lock state. Opened by the daily "
+                       "trigger check.") % os.environ["ISSUE_DETAIL"],
+              "labels": ["scrape-failure"],
+          }
+          open("/tmp/issue.json", "w").write(json.dumps(body))
+          PYEOF
+            curl -s --max-time 20 -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/aixfeed/aix-studio-runner/issues" \
+              -d @/tmp/issue.json -o /tmp/issue-resp.json \
+              -w "issue http=%{http_code}\n" || true
+          fi
+          if [ "$CHECK_RC" != "0" ] && [ "$CHECK_RC" != "2" ]; then
             # page now, still fire — today's run may heal it. V2-P3: the
             # detail goes in via env + json.dumps (no shell interpolation into
             # python source — blob content cannot break/inject the payload).
