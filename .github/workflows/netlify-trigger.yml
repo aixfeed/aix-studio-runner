@@ -153,40 +153,57 @@ jobs:
               -w "issue http=%{http_code}\n" || true
           fi
           # --- build-budget guard (legacy free plan: 300 build-min/mo) ---
+          # V4 round-12: the deploys API DOES expose durations (deploy_time
+          # for ready builds; updated_at-created_at for errored ones —
+          # validated ±2% against known elapsed_s), so this is now a true
+          # MINUTES-SUM guard (was a build-count proxy; the "legacy plan
+          # has no minutes API" conclusion was wrong). Nominal October
+          # ~185 min (31 daily scrapes ~270s + 4 Monday media ~400s);
+          # warn 200 / alert 250 leaves a month-end buffer.
           BUDGET=$(BUDGET_TOKEN="$NETLIFY_AUTH_TOKEN" BUDGET_SITE="$OPS_SITE_ID" python3 - <<'PYEOF'
           import datetime, json, os, urllib.request
           token, site = os.environ["BUDGET_TOKEN"], os.environ["BUDGET_SITE"]
           now = datetime.datetime.now(datetime.timezone.utc)
           month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-          n, page = 0, 1
+          n = minutes = 0
+          page = 1
           try:
               while page <= 10:
                   req = urllib.request.Request(
-                      "https://api.netlify.com/api/v1/sites/%s/builds?per_page=100&page=%d" % (site, page),
+                      "https://api.netlify.com/api/v1/sites/%s/deploys?per_page=100&page=%d" % (site, page),
                       headers={"Authorization": "Bearer " + token})
                   with urllib.request.urlopen(req, timeout=30) as r:
-                      builds = json.loads(r.read())
-                  if not builds:
+                      deps = json.loads(r.read())
+                  if not deps:
                       break
-                  for b in builds:
+                  for b in deps:
                       t = datetime.datetime.fromisoformat(b["created_at"].replace("Z", "+00:00"))
-                      if t >= month_start:
-                          n += 1
+                      if t < month_start:
+                          continue
+                      n += 1
+                      d = 0.0
+                      if b.get("deploy_time") is not None:
+                          d = float(b["deploy_time"])
+                      elif b.get("updated_at"):
+                          try:
+                              t2 = datetime.datetime.fromisoformat(b["updated_at"].replace("Z", "+00:00"))
+                              d = max(0.0, (t2 - t).total_seconds())
+                          except Exception:
+                              pass
+                      minutes += d / 60.0
                   page += 1
-              # nominal daily cadence ~35/mo (31 scrapes + 4 Monday media;
-              # October measured projection ~185 of 300 build-min — V4).
-              # V4-P3-1: warn/alert recalibrated 34/40 -> 37/45 so a clean
-              # 31-day month does not trip the warn.
-              print("builds_this_month=%d" % n)
-              if n > 45:
-                  print("BUDGET_ALERT: %d builds this month — projected >250 "
-                        "build-min of the 300/mo legacy plan. Check the "
-                        "builds list for runaway/looping builds." % n)
-              elif n > 37:
-                  print("BUDGET_WARN: %d builds this month (nominal ~35)" % n)
+              print("builds_this_month=%d build_minutes=%.0f" % (n, minutes))
+              if minutes > 250:
+                  print("BUDGET_ALERT: %.0f build-min this month of the 300/mo "
+                        "legacy plan — runaway/looping builds likely. Check "
+                        "the builds list." % minutes)
+              elif minutes > 200:
+                  print("BUDGET_WARN: %.0f build-min this month (nominal "
+                        "~185; alert 250)" % minutes)
           except Exception as e:
               print("budget check unreadable: %s" % str(e)[:80])
           PYEOF
+          )
           )
           echo "$BUDGET"
           # --- fire the hook (title body REQUIRED: dispatch matches it) ---
