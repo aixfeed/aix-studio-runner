@@ -204,7 +204,6 @@ jobs:
               print("budget check unreadable: %s" % str(e)[:80])
           PYEOF
           )
-          )
           echo "$BUDGET"
           # --- fire the hook (title body REQUIRED: dispatch matches it) ---
           CODE=$(curl -s -o /tmp/hook.json -w "%{http_code}" --max-time 30 -X POST \
