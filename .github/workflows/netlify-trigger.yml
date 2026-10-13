@@ -93,8 +93,18 @@ jobs:
               print("unreadable: %s | %s" % (str(e)[:120], media_line))
               sys.exit(1)
           PYEOF
+          # V5-P1 (2026-10-13): under bash -e a failing assignment
+          # `DETAIL=$(python3 ...)` KILLS the step before CHECK_RC is
+          # captured — observed live: the Oct 10 Netlify build failed at
+          # its data-repo clone (expired PAT -> scrape-status rc=1), then
+          # every later trigger died HERE in 0.6s with zero output: no
+          # status echo, no stale-issue, NO HOOK POST — the designed
+          # "page now, still fire — today's run may heal it" path was dead
+          # code (same class as round-11 V1-P1-2). Shield the capture.
+          set +e
           DETAIL=$(python3 /tmp/check_status.py "$NETLIFY_AUTH_TOKEN" "$VAULT0_SITE_ID" 2>&1)
           CHECK_RC=$?
+          set -e
           echo "last scrape status: $DETAIL (check_rc=$CHECK_RC)"
           if [ "$CHECK_RC" = "2" ] || [ "$CHECK_RC" = "3" ]; then
             # scrape healthy but a subsystem is degraded (2 = media build
@@ -160,6 +170,10 @@ jobs:
           # has no minutes API" conclusion was wrong). Nominal October
           # ~185 min (31 daily scrapes ~270s + 4 Monday media ~400s);
           # warn 200 / alert 250 leaves a month-end buffer.
+          # V5-P1 sibling: shield the budget capture too (the python is
+          # non-exiting by construction, but one unhandled edge kills the
+          # step before the hook fires — defense in depth).
+          set +e
           BUDGET=$(BUDGET_TOKEN="$NETLIFY_AUTH_TOKEN" BUDGET_SITE="$OPS_SITE_ID" python3 - <<'PYEOF'
           import datetime, json, os, urllib.request
           token, site = os.environ["BUDGET_TOKEN"], os.environ["BUDGET_SITE"]
@@ -204,6 +218,7 @@ jobs:
               print("budget check unreadable: %s" % str(e)[:80])
           PYEOF
           )
+          set -e
           echo "$BUDGET"
           # --- fire the hook (title body REQUIRED: dispatch matches it) ---
           CODE=$(curl -s -o /tmp/hook.json -w "%{http_code}" --max-time 30 -X POST \
