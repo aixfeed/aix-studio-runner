@@ -70,10 +70,21 @@ jobs:
               deferred = bool(d.get("deferred"))
               ok = age_h <= 36 and (rc in (0, 2) or (rc == 3 and deferred))
               drift = str(d.get("drift") or "")
-              print("ts=%s age=%.1fh rc=%s partial=%s chain=%s/%s drift=%s/%s | %s" % (
-                  ts, age_h, rc, d.get("partial"), d.get("chain_http"),
-                  d.get("chain_reason"), d.get("drift"), d.get("drift_findings"),
-                  media_line))
+              print("ts=%s age=%.1fh rc=%s partial=%s token_dead=%s chain=%s/%s drift=%s/%s | %s" % (
+                  ts, age_h, rc, d.get("partial"), d.get("token_dead"),
+                  d.get("chain_http"), d.get("chain_reason"),
+                  d.get("drift"), d.get("drift_findings"), media_line))
+              # R24 (2026-10-18): exit 4 = AIX token DEAD (rc=5 or token_dead=1,
+              # blob fresh). Auth surfaces are silently dark (public data still
+              # ships — the hook below still fires). Owner action required:
+              # re-login on aix.studio, refresh AIX_TOKEN on 4 surfaces (ops
+              # site env, runner secret, scripts/.aix_token, env-backup).
+              # Stale wins over token-dead (age > 36h falls through to exit 1:
+              # a dead-token pipeline that also went stale is a bigger outage
+              # and the stale issue covers it).
+              token_dead = bool(d.get("token_dead")) or rc == 5
+              if token_dead and age_h <= 36:
+                  sys.exit(4)
               # round-12: exit 2 = scrape healthy but the MEDIA build reported
               # a hard error (thumbs_rc 1 = error; 0/3 = complete/backlog-remains
               # are healthy). Monitors the previously-unread media status blob
@@ -106,36 +117,63 @@ jobs:
           CHECK_RC=$?
           set -e
           echo "last scrape status: $DETAIL (check_rc=$CHECK_RC)"
-          if [ "$CHECK_RC" = "2" ] || [ "$CHECK_RC" = "3" ]; then
+          if [ "$CHECK_RC" = "2" ] || [ "$CHECK_RC" = "3" ] || [ "$CHECK_RC" = "4" ]; then
             # scrape healthy but a subsystem is degraded (2 = media build
-            # hard-error; 3 = drift validator crashed and is fail-open blind).
-            # Separate issue, hook still fires (scrape is independent).
+            # hard-error; 3 = drift validator crashed and is fail-open blind;
+            # 4 = AIX token expired — auth surfaces dark, owner re-login
+            # required). Separate issue, hook still fires (scrape is
+            # independent).
             if [ "$CHECK_RC" = "2" ]; then
               ISSUE_TITLE="Media build error (thumbs hard-fail)"
               ISSUE_BODY_PREAMBLE="The last media build reported a hard thumbs error (rc not 0/3). Check the Netlify builds list and the thumbs-push-lock state."
+            elif [ "$CHECK_RC" = "4" ]; then
+              ISSUE_TITLE="AIX token expired — auth scrape dead (owner re-login required)"
+              ISSUE_BODY_PREAMBLE="The AIX site token died (scrape-status rc=5 / token_dead=1, fresh). Auth surfaces (canvas graphs, flow details, character/prop/scene libs) are NOT scraping; public surfaces continue. The token lives ~30 days server-side. OWNER ACTION: log into aix.studio in a browser, copy the fresh token, then update ALL FOUR surfaces: (1) Netlify aix-media-ops site env AIX_TOKEN (netlify CLI env:set), (2) this runner repo's Actions secret AIX_TOKEN, (3) scripts/.aix_token in the data repo working copy, (4) env-backup/aix_token + env-backup/secrets.env AIX_TOKEN in the data repo. After refresh, the next scrape auto-catches-up all missed auth data (id-dedup accumulate)."
             else
               ISSUE_TITLE="Drift validator crashed (fail-open blind)"
               ISSUE_BODY_PREAMBLE="The drift validator exited non-zero without a verdict (drift=rcNNN in the status). ALL drift detection incl. the auth-lib count guards is blind until fixed. Check schema_pins.json validity and the validator step logs in the last scrape build."
             fi
-            ISSUE_DETAIL="$DETAIL" ISSUE_TITLE="$ISSUE_TITLE" ISSUE_BODY_PREAMBLE="$ISSUE_BODY_PREAMBLE" python3 - <<'PYEOF'
-          import json, os
-          body = {
-              "title": os.environ["ISSUE_TITLE"],
-              "body": (os.environ["ISSUE_BODY_PREAMBLE"]
-                       + "\n\nLast status: %s\n\nOpened by the daily "
-                       "trigger check.") % os.environ["ISSUE_DETAIL"],
-              "labels": ["scrape-failure"],
-          }
-          open("/tmp/issue.json", "w").write(json.dumps(body))
-          PYEOF
-            curl -s --max-time 20 -X POST \
+            # R24: dedup — a dead token persists for days until the owner
+            # re-logs in; a plain create would spam one issue per trigger.
+            # LIST open issues directly (search API is eventually-consistent)
+            # and skip creation when an open one already carries this title.
+            set +e
+            OPEN_ISSUES=$(curl -s --max-time 20 \
               -H "Authorization: token $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/aixfeed/aix-studio-runner/issues" \
-              -d @/tmp/issue.json -o /tmp/issue-resp.json \
-              -w "issue http=%{http_code}\n" || true
+              "https://api.github.com/repos/aixfeed/aix-studio-runner/issues?state=open&per_page=100")
+            set -e
+            ISSUE_DETAIL="$DETAIL" ISSUE_TITLE="$ISSUE_TITLE" ISSUE_BODY_PREAMBLE="$ISSUE_BODY_PREAMBLE" OPEN_ISSUES="$OPEN_ISSUES" python3 - <<'PYEOF'
+          import json, os
+          title = os.environ["ISSUE_TITLE"]
+          try:
+              existing = {i.get("title") for i in json.loads(os.environ["OPEN_ISSUES"] or "[]")
+                          if isinstance(i, dict) and "pull_request" not in i}
+          except Exception:
+              existing = set()
+          if title in existing:
+              print("issue dedup: open issue '%s' already exists — skipping create" % title)
+          else:
+              body = {
+                  "title": title,
+                  "body": (os.environ["ISSUE_BODY_PREAMBLE"]
+                           + "\n\nLast status: %s\n\nOpened by the daily "
+                           "trigger check.") % os.environ["ISSUE_DETAIL"],
+                  "labels": ["scrape-failure"],
+              }
+              open("/tmp/issue.json", "w").write(json.dumps(body))
+          PYEOF
+            if [ -f /tmp/issue.json ]; then
+              curl -s --max-time 20 -X POST \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/aixfeed/aix-studio-runner/issues" \
+                -d @/tmp/issue.json -o /tmp/issue-resp.json \
+                -w "issue http=%{http_code}\n" || true
+              rm -f /tmp/issue.json
+            fi
           fi
-          if [ "$CHECK_RC" != "0" ] && [ "$CHECK_RC" != "2" ] && [ "$CHECK_RC" != "3" ]; then
+          if [ "$CHECK_RC" != "0" ] && [ "$CHECK_RC" != "2" ] && [ "$CHECK_RC" != "3" ] && [ "$CHECK_RC" != "4" ]; then
             # page now, still fire — today's run may heal it. V2-P3: the
             # detail goes in via env + json.dumps (no shell interpolation into
             # python source — blob content cannot break/inject the payload).

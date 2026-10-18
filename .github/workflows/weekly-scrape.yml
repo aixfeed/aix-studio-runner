@@ -63,7 +63,12 @@ jobs:
               deferred = d.get("deferred")
               drift = d.get("drift")
               fresh = age_h <= 36
-              clean = fresh and rc in (0, 2) and not deferred
+              # R24: rc=5 = AIX token dead. The Netlify run STILL pushed its
+              # public data before writing that status (push precedes
+              # write_status), so a GHA catch-up would only duplicate public
+              # work and fail its own auth steps — treat as clean for the
+              # GATE. The token-expired issue is the daily trigger's job.
+              clean = fresh and rc in (0, 2, 5) and not deferred
               detail = "age=%.1fh rc=%s partial=%s deferred=%s drift=%s/%s" % (
                   age_h, rc, partial, deferred, drift, d.get("drift_findings"))
               print(("CLEAN " if clean else "RUN ") + detail)
