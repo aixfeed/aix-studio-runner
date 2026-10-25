@@ -202,7 +202,20 @@ jobs:
         env:
           AIX_BASE: ${{ github.workspace }}/data
           AIX_TRANSPORT: playwright
-        run: python3 scripts/aix_auth_scrape.py
+        # R25 C4 (audit r25-a P1-2): exit 5 = token dead — a KNOWN, advertised
+        # condition (rc=5 channel opens the owner-action issue). Tolerate it:
+        # export the marker for validate (pending-vs-fail split) + skip the
+        # auth-DEPENDENT lib-detail sweep below. Any other rc still fails the
+        # job (real breakage).
+        run: |
+          python3 scripts/aix_auth_scrape.py
+          rc=$?
+          if [ "$rc" -eq 5 ]; then
+            echo "AIX_TOKEN_DEAD=1" >> "$GITHUB_ENV"
+            echo "::warning::AIX token dead (333) — auth surfaces dark; lib-detail sweep will skip; validate runs in pending-aware mode"
+            exit 0
+          fi
+          exit $rc
 
       - name: Prism tag sweep (style_materials taxonomy)
         if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
@@ -212,7 +225,7 @@ jobs:
         run: python3 scripts/aix_prism_tags.py
 
       - name: Lib detail sweep (character/prop/scene /detail enrichment)
-        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1'
+        if: steps.gate.outcome == 'success' && env.SCRAPE_SKIP != '1' && env.AIX_TOKEN_DEAD != '1'
         env:
           AIX_BASE: ${{ github.workspace }}/data
           AIX_TRANSPORT: playwright
@@ -416,13 +429,28 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `Weekly AIX scrape failed (${new Date().toISOString().slice(0, 10)})`,
-              body: `Automated scrape run failed.\n\nRun logs: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nLikely causes: AIX_TOKEN expired (code 333), site redeploy/schema drift, or WAF blocking the runner IP.`,
-              labels: ['scrape-failure']
-            });
+            // R25 C5 (audit r25-a P2-9): dedup — daily-failing catch-ups opened
+            // one issue per day (observed #17/#19/#21/#23). Skip when an OPEN
+            // issue with the same title prefix exists and is < 72h old.
+            const prefix = 'Weekly AIX scrape failed';
+            const opens = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', per_page: 100 });
+            const cutoff = Date.now() - 72 * 3600 * 1000;
+            const dup = opens.data.find(i =>
+              !i.pull_request && i.title.startsWith(prefix) &&
+              new Date(i.created_at).getTime() > cutoff);
+            if (dup) {
+              core.info(`issue dedup: open ${dup.title} (#${dup.number}) is <72h old — skipping create`);
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `Weekly AIX scrape failed (${new Date().toISOString().slice(0, 10)})`,
+                body: `Automated scrape run failed.\n\nRun logs: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nLikely causes: AIX_TOKEN expired (code 333), site redeploy/schema drift, or WAF blocking the runner IP.`,
+                labels: ['scrape-failure']
+              });
+            }
 
   heartbeat:
     # Keeps THIS repo's scheduled cron alive: GitHub auto-disables cron

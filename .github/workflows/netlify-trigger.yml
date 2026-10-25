@@ -97,6 +97,22 @@ jobs:
               # looks. Escalate to an issue (hook still fires).
               if ok and drift.startswith("rc"):
                   sys.exit(3)
+              # R25 C6: EXPIRES-SOON — the ops scrape writes token_days_left
+              # (mint epoch embedded in the token string + observed 30d TTL).
+              # Warn BEFORE death (7d window — owner latency observed >5d).
+              # Precedence: stale > dead > media > drift > SOON (active
+              # failures outrank the pre-warning). Only when otherwise healthy
+              # and not already dead. Robust to string-typed values.
+              days_left = None
+              try:
+                  days_left = int(float(d.get("token_days_left")))
+              except (TypeError, ValueError):
+                  pass
+              if (days_left is not None and 0 < days_left <= 7
+                      and ok and not token_dead):
+                  print("token expires in %dd (%s) — pre-expiry warning" % (
+                      days_left, d.get("token_expires_at", "?")))
+                  sys.exit(5)
               sys.exit(0 if ok else 1)
           except SystemExit:
               raise
@@ -117,18 +133,22 @@ jobs:
           CHECK_RC=$?
           set -e
           echo "last scrape status: $DETAIL (check_rc=$CHECK_RC)"
-          if [ "$CHECK_RC" = "2" ] || [ "$CHECK_RC" = "3" ] || [ "$CHECK_RC" = "4" ]; then
+          if [ "$CHECK_RC" = "2" ] || [ "$CHECK_RC" = "3" ] || [ "$CHECK_RC" = "4" ] || [ "$CHECK_RC" = "5" ]; then
             # scrape healthy but a subsystem is degraded (2 = media build
             # hard-error; 3 = drift validator crashed and is fail-open blind;
             # 4 = AIX token expired — auth surfaces dark, owner re-login
-            # required). Separate issue, hook still fires (scrape is
-            # independent).
+            # required; 5 = R25 pre-expiry warning — token dies within 7d,
+            # owner re-login BEFORE the outage). Separate issue, hook still
+            # fires (scrape is independent).
             if [ "$CHECK_RC" = "2" ]; then
               ISSUE_TITLE="Media build error (thumbs hard-fail)"
               ISSUE_BODY_PREAMBLE="The last media build reported a hard thumbs error (rc not 0/3). Check the Netlify builds list and the thumbs-push-lock state."
             elif [ "$CHECK_RC" = "4" ]; then
               ISSUE_TITLE="AIX token expired — auth scrape dead (owner re-login required)"
               ISSUE_BODY_PREAMBLE="The AIX site token died (scrape-status rc=5 / token_dead=1, fresh). Auth surfaces (canvas graphs, flow details, character/prop/scene libs) are NOT scraping; public surfaces continue. The token lives ~30 days server-side. OWNER ACTION: log into aix.studio in a browser, copy the fresh token, then update ALL FOUR surfaces: (1) Netlify aix-media-ops site env AIX_TOKEN (netlify CLI env:set), (2) this runner repo's Actions secret AIX_TOKEN, (3) scripts/.aix_token in the data repo working copy, (4) env-backup/aix_token + env-backup/secrets.env AIX_TOKEN in the data repo. After refresh, the next scrape auto-catches-up all missed auth data (id-dedup accumulate)."
+            elif [ "$CHECK_RC" = "5" ]; then
+              ISSUE_TITLE="AIX token expiring soon — re-login BEFORE it dies"
+              ISSUE_BODY_PREAMBLE="The AIX site token expires within 7 days (mint epoch is embedded in the token; observed server TTL ~30d). Auth surfaces WILL go dark when it dies (public surfaces continue; recovery is automatic after refresh — id-dedup accumulate). OWNER ACTION (do it now, avoid the outage): log into aix.studio in a browser, copy the fresh token, then update ALL FOUR surfaces: (1) Netlify aix-media-ops site env AIX_TOKEN, (2) this runner repo's Actions secret AIX_TOKEN, (3) scripts/.aix_token in the data repo, (4) env-backup/aix_token + env-backup/secrets.env in the data repo."
             else
               ISSUE_TITLE="Drift validator crashed (fail-open blind)"
               ISSUE_BODY_PREAMBLE="The drift validator exited non-zero without a verdict (drift=rcNNN in the status). ALL drift detection incl. the auth-lib count guards is blind until fixed. Check schema_pins.json validity and the validator step logs in the last scrape build."
@@ -173,32 +193,52 @@ jobs:
               rm -f /tmp/issue.json
             fi
           fi
-          if [ "$CHECK_RC" != "0" ] && [ "$CHECK_RC" != "2" ] && [ "$CHECK_RC" != "3" ] && [ "$CHECK_RC" != "4" ]; then
+          if [ "$CHECK_RC" != "0" ] && [ "$CHECK_RC" != "2" ] && [ "$CHECK_RC" != "3" ] && [ "$CHECK_RC" != "4" ] && [ "$CHECK_RC" != "5" ]; then
             # page now, still fire — today's run may heal it. V2-P3: the
             # detail goes in via env + json.dumps (no shell interpolation into
             # python source — blob content cannot break/inject the payload).
-            ISSUE_DETAIL="$DETAIL" python3 - <<'PYEOF'
-          import json, os
-          body = {
-              "title": "Netlify scrape stale/failed",
-              "body": ("The scrape-status blob is stale (>36h) or failed. "
-                       "Last status: %s\n\nThe daily Netlify scrape did not "
-                       "complete cleanly. Check https://app.netlify.com/sites/"
-                       "aix-media-ops/builds (last scrape-mode build), the "
-                       "build-minutes budget, and whether the trigger fired "
-                       "the hook. This issue was opened by the daily 03:00 "
-                       "UTC trigger check; the hook below was still fired so "
-                       "today may self-heal.") % os.environ["ISSUE_DETAIL"],
-              "labels": ["scrape-failure"],
-          }
-          open("/tmp/issue.json", "w").write(json.dumps(body))
-          PYEOF
-            curl -s --max-time 20 -X POST \
+            # R25 C5: exact-title dedup (this channel opened daily duplicates
+            # #18/#20/#22 while the validate gate was blocked).
+            set +e
+            OPEN_ISSUES2=$(curl -s --max-time 20 \
               -H "Authorization: token $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/aixfeed/aix-studio-runner/issues" \
-              -d @/tmp/issue.json -o /tmp/issue-resp.json \
-              -w "issue http=%{http_code}\n" || true
+              "https://api.github.com/repos/aixfeed/aix-studio-runner/issues?state=open&per_page=100")
+            set -e
+            ISSUE_DETAIL="$DETAIL" OPEN_ISSUES="$OPEN_ISSUES2" python3 - <<'PYEOF'
+          import json, os
+          title = "Netlify scrape stale/failed"
+          try:
+              existing = {i.get("title") for i in json.loads(os.environ["OPEN_ISSUES"] or "[]")
+                          if isinstance(i, dict) and "pull_request" not in i}
+          except Exception:
+              existing = set()
+          if title in existing:
+              print("issue dedup: open issue '%s' already exists — skipping create" % title)
+          else:
+              body = {
+                  "title": title,
+                  "body": ("The scrape-status blob is stale (>36h) or failed. "
+                           "Last status: %s\n\nThe daily Netlify scrape did not "
+                           "complete cleanly. Check https://app.netlify.com/sites/"
+                           "aix-media-ops/builds (last scrape-mode build), the "
+                           "build-minutes budget, and whether the trigger fired "
+                           "the hook. This issue was opened by the daily 03:00 "
+                           "UTC trigger check; the hook below was still fired so "
+                           "today may self-heal.") % os.environ["ISSUE_DETAIL"],
+                  "labels": ["scrape-failure"],
+              }
+              open("/tmp/issue.json", "w").write(json.dumps(body))
+          PYEOF
+            if [ -f /tmp/issue.json ]; then
+              curl -s --max-time 20 -X POST \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/aixfeed/aix-studio-runner/issues" \
+                -d @/tmp/issue.json -o /tmp/issue-resp.json \
+                -w "issue http=%{http_code}\n" || true
+              rm -f /tmp/issue.json
+            fi
           fi
           # --- build-budget guard (legacy free plan: 300 build-min/mo) ---
           # V4 round-12: the deploys API DOES expose durations (deploy_time
